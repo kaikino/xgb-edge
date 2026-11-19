@@ -451,6 +451,8 @@ computes).
 ```sh
 make test        # unit and property tests (about 2 minutes)
 make parity      # the model zoo against xgboost on the host (about 1 minute once models are trained)
+make mutation    # do the threshold tests catch deliberately broken rounding? (about 2 minutes)
+make oldver      # models trained by older xgboost releases (needs uv and network on first run)
 ```
 
 * `tests/test_thresholds.py`: property-based tests (Hypothesis). They build
@@ -458,9 +460,10 @@ make parity      # the model zoo against xgboost on the host (about 1 minute onc
   including zeros, denormals, the largest finite floats and thresholds that
   are adjacent floats of each other, feed inputs equal to each threshold and
   one float32 below and above it, and require the compiled C to reach the
-  same leaf as xgboost itself. The same for integer inputs. Fifteen
-  deliberately wrong variants of the rounding (for example `<` instead of
-  `<=` in the rank search) were each caught by these tests.
+  same leaf as xgboost itself. The same for integer inputs.
+  `python -m harness.mutation` checks that these tests have teeth: it applies
+  15 deliberately wrong variants of the rounding one at a time (for example
+  `<` instead of `<=` in the rank search) and each one makes the tests fail.
 * `tests/test_model.py`: exact decimal-to-float32 parsing of the JSON
   (including values a hair away from a float32 midpoint) and one test per
   rejected model variant.
