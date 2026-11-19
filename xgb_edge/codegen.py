@@ -116,10 +116,19 @@ def generate(model: Model, tp: ThresholdPlan, lp: LeafPlan, pk: Packed, name: st
     arrays: List[CArray] = []
     defs: List[str] = []
 
+    emitted = {}
+
     def add(ctype: str, elem: int, suffix: str, values, what: str, per_line: int = 20) -> str:
         arr_name = f"{name}_{suffix}"
-        arrays.append(CArray(arr_name, ctype, elem, len(values), what))
-        defs.append(f"/* {what} */\n" + _fmt_array(ctype, arr_name, values, per_line))
+        vals = tuple(int(v) for v in values)
+        # Two tables with identical type and contents are emitted once (an
+        # optimising compiler would merge them anyway, so this keeps the
+        # reported size equal to the built size).
+        if (ctype, vals) in emitted:
+            return emitted[(ctype, vals)]
+        emitted[(ctype, vals)] = arr_name
+        arrays.append(CArray(arr_name, ctype, elem, len(vals), what))
+        defs.append(f"/* {what} */\n" + _fmt_array(ctype, arr_name, vals, per_line))
         return arr_name
 
     has_nodes = flat.n_nodes > 0
@@ -168,12 +177,15 @@ extern "C" {{
 #define {P}_NUM_MARGINS {n_groups}
 #define {P}_MARGIN_SHIFT {lp.shift}
 
+/* type of one element of the feature array */
+typedef {in_t} {name}_feature_t;
+
 /* {feat_doc}
  * {m_doc}
  * {ret_doc}
  * Uses no floating-point operations and no static RAM; reentrant.
  */
-int {name}_predict(const {in_t} *features, int32_t *margins);
+int {name}_predict(const {name}_feature_t *features, int32_t *margins);
 
 #ifdef __cplusplus
 }}
@@ -202,14 +214,14 @@ unsigned long {name}_comparisons;
         # Degenerate model: no split anywhere, the prediction is a constant.
         bias = lp.bias
         best = (1 if bias[0] > 0 else 0) if model.is_binary else int(np.argmax(bias))
-        add("int32_t", 4, "bias", bias, "constant margins (the model has no splits)")
+        assigns = "\n".join(f"        margins[{g}] = {b}L;" for g, b in enumerate(bias))
         body = f"""
-int {name}_predict(const {in_t} *features, int32_t *margins)
+/* The model has no splits: every input gets the same margins. */
+int {name}_predict(const {name}_feature_t *features, int32_t *margins)
 {{
     (void)features;
     if (margins) {{
-        uint32_t g;
-        for (g = 0; g < {n_groups}u; g++) margins[g] = {name}_bias[g];
+{assigns}
     }}
     return {best};
 }}
@@ -368,7 +380,7 @@ int {name}_predict(const {in_t} *features, int32_t *margins)
 
     if model.is_binary:
         body = f"""
-int {name}_predict(const {in_t} *features, int32_t *margins)
+int {name}_predict(const {name}_feature_t *features, int32_t *margins)
 {{
     {qtype} q[{tp.n_slots}];
     const uint8_t *tree = {name}_nodes;
@@ -388,7 +400,7 @@ int {name}_predict(const {in_t} *features, int32_t *margins)
 """
     else:
         body = f"""
-int {name}_predict(const {in_t} *features, int32_t *margins)
+int {name}_predict(const {name}_feature_t *features, int32_t *margins)
 {{
     {qtype} q[{tp.n_slots}];
     const uint8_t *tree = {name}_nodes;

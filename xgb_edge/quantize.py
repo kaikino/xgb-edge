@@ -285,16 +285,24 @@ def leaf_products(model: Model) -> List[np.ndarray]:
 
     Both factors are float32, so the float64 product is exact.
     """
-    return [t.value.astype(np.float64) * np.float64(t.weight) for t in model.trees]
+    out = []
+    for t in model.trees:
+        p = np.zeros(t.value.size, dtype=np.float64)
+        leaves = t.leaf_nodes
+        p[leaves] = t.value[leaves].astype(np.float64) * np.float64(t.weight)
+        out.append(p)
+    return out
 
 
 def _quantize_at(model: Model, prods: List[np.ndarray], const_real: List[Fraction], shift: int):
     scale = math.ldexp(1.0, shift)
     q, max_q_tree = [], []
     for t, p in zip(model.trees, prods):
-        qt = np.rint(p * scale).astype(np.int64)  # exact: power-of-two scaling, ties to even
+        leaves = t.leaf_nodes
+        qt = np.zeros(p.size, dtype=np.int64)
+        qt[leaves] = np.rint(p[leaves] * scale).astype(np.int64)  # exact: power-of-two scaling, ties to even
         q.append(qt)
-        max_q_tree.append(int(np.abs(qt[t.leaf_nodes]).max()))
+        max_q_tree.append(int(np.abs(qt[leaves]).max()))
     bias = [int(round(c * (1 << shift))) for c in const_real]  # Fraction: exact, ties to even
     return q, max_q_tree, bias
 
