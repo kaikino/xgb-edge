@@ -17,20 +17,42 @@ DEFAULT_CFLAGS = "-mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 -Os
 CODE_BYTES_ESTIMATE = 300
 
 
-def find_cross_compiler() -> Optional[str]:
-    """Locate arm-none-eabi-gcc on PATH or inside an Arduino installation."""
-    exe = shutil.which("arm-none-eabi-gcc")
+#: Cross-compile targets the tool knows how to measure: name -> (compiler, flags).
+TARGETS = {
+    "cortex-m4": ("arm-none-eabi-gcc", DEFAULT_CFLAGS),                       # nRF52840 and friends
+    "esp32": ("xtensa-esp32-elf-gcc", "-mlongcalls -Os"),                     # Xtensa ESP32
+    "esp32c3": ("riscv32-esp-elf-gcc", "-march=rv32imc_zicsr_zifencei -mabi=ilp32 -Os"),  # RISC-V ESP32
+    "avr": ("avr-gcc", "-mmcu=atmega328p -Os"),                               # 8-bit, 16-bit int
+}
+
+_ARDUINO_DIRS = ("~/Library/Arduino15", "~/.arduino15", "~/AppData/Local/Arduino15")
+
+
+def find_compiler(exe_name: str) -> Optional[str]:
+    """Locate a cross compiler on PATH or inside an Arduino installation."""
+    exe = shutil.which(exe_name)
     if exe:
         return exe
-    pats = [
-        "~/Library/Arduino15/packages/*/tools/arm-none-eabi-gcc/*/bin/arm-none-eabi-gcc",
-        "~/.arduino15/packages/*/tools/arm-none-eabi-gcc/*/bin/arm-none-eabi-gcc",
-    ]
-    for pat in pats:
-        hits = sorted(glob.glob(os.path.expanduser(pat)))
+    for base in _ARDUINO_DIRS:
+        hits = sorted(glob.glob(os.path.expanduser(f"{base}/packages/*/tools/*/*/bin/{exe_name}")))
         if hits:
             return hits[-1]
     return None
+
+
+def find_cross_compiler() -> Optional[str]:
+    """Locate arm-none-eabi-gcc (the default measurement target)."""
+    return find_compiler("arm-none-eabi-gcc")
+
+
+def available_targets() -> Dict[str, tuple]:
+    """The targets in TARGETS whose compiler is installed: name -> (compiler path, flags)."""
+    out = {}
+    for name, (exe, flags) in TARGETS.items():
+        path = find_compiler(exe)
+        if path:
+            out[name] = (path, flags)
+    return out
 
 
 def measure(header: str, source: str, name: str, cc: str, cflags: str = DEFAULT_CFLAGS) -> Dict:
@@ -54,11 +76,12 @@ def measure(header: str, source: str, name: str, cc: str, cflags: str = DEFAULT_
             parts = line.split()
             if len(parts) >= 2 and parts[1].isdigit():
                 sec, sz = parts[0], int(parts[1])
-                if sec.startswith(".text"):
+                # .literal: Xtensa literal pools (code); .srodata: RISC-V small read-only data
+                if sec.startswith((".text", ".literal")):
                     text += sz
-                elif sec.startswith(".rodata"):
+                elif sec.startswith((".rodata", ".srodata")):
                     rodata += sz
-                elif sec.startswith((".data", ".bss")):
+                elif sec.startswith((".data", ".bss", ".sdata", ".sbss")):
                     other += sz
         stack = None
         su = os.path.join(d, name + ".su")
@@ -75,14 +98,15 @@ def add_flash_totals(rep: Dict, measured: Optional[Dict]) -> None:
     fl = rep["flash"]
     if measured:
         fl["code_bytes"] = measured["code_bytes"]
-        fl["code_source"] = f"measured with {measured['cc']} {measured['cflags']}"
+        fl["code_source"] = (f"measured for {measured['target']} with " if measured.get("target") else
+                             "measured with ") + f"{measured['cc']} {measured['cflags']}"
         fl["rodata_bytes_measured"] = measured["rodata_bytes"]
         rep["ram"]["stack_bytes"] = measured["stack_bytes"]
         rep["ram"]["stack_source"] = "measured (-fstack-usage)"
         rep["ram"]["static_bytes"] = measured["static_ram_bytes"]
     else:
         fl["code_bytes"] = CODE_BYTES_ESTIMATE
-        fl["code_source"] = "estimate (no cross compiler found; pass --cc to measure)"
+        fl["code_source"] = "estimate: no cross compiler was run (see --target / --cc)"
         rep["ram"]["stack_bytes"] = rep["ram"]["rank_array_bytes"] + 48
         rep["ram"]["stack_source"] = "estimate (rank array + ~48 bytes of locals)"
     fl["total_bytes"] = fl["data_bytes"] + fl["code_bytes"]
@@ -145,6 +169,8 @@ def render(rep: Dict) -> str:
              f"largest |leaf| {lf['max_abs_leaf']:.6g}")
     L.append(f"  worst-case error on a class margin, over all possible inputs: {lf['worst_case_margin_error']:.3g}")
     L.append("  split thresholds: lossless (every comparison equals XGBoost's float32 x < threshold)")
+    L.append(f"  certainty check for any input: a margin gap above {lf['safe_gap']} "
+             f"({lf['safe_gap_margin_units']:.3g}) guarantees XGBoost's class ({rep['name'].upper()}_SAFE_GAP)")
     v = rep.get("validation")
     L.append("")
     if v:
@@ -163,6 +189,7 @@ def render(rep: Dict) -> str:
                  f"{v['class_differs_from_exact_arithmetic']}"
                  + (f" (rows {v['differs_indices'][:20]})" if v["class_differs_from_exact_arithmetic"] else ""))
         L.append("  every sample not listed as at risk is guaranteed to get XGBoost's class")
+        L.append(f"  samples whose margin gap is within the run-time certainty check (SAFE_GAP): {v['within_safe_gap']}")
         L.append(f"  split comparisons per inference on this data: mean {v['tree_comparisons_mean']:.1f}, "
                  f"max {v['tree_comparisons_max']}")
     else:

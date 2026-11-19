@@ -3,6 +3,7 @@
     python -m harness.device list
     python -m harness.device run MODEL [--variant N] [--kind xgbe|float] [--board A|B]
     python -m harness.device suite [--board A]
+    python -m harness.device example [--board B]     (the packaged Arduino example)
 
 For a zoo model it exports C (or generates the float baseline), builds the
 test firmware in firmware/xgbe_bench around it, uploads it to the chosen board
@@ -468,10 +469,52 @@ def run_model(model_name: str, variant: int = 0, kind: str = "xgbe", board: str 
     return res
 
 
+def run_packaged_example(board: str = "B", model_name: str = "mc5_d4_r50_hist_missing", opt: str = "-Os") -> Dict:
+    """Export the Arduino package, build its example, flash it and read its self-check line from the board."""
+    from xgb_edge.package import write_package
+    serial = board_serial(board)
+    tr = zoo.train(zoo.by_name(model_name))
+    exp = export_model(tr.model_path, ExportOptions(name="demo_model", leaf_bits=16), validation=tr.X)
+    pkg = os.path.join(DEVDIR, "arduino_example", "demo_model")
+    shutil.rmtree(pkg, ignore_errors=True)
+    write_package(exp, "arduino", pkg, sample=tr.X)
+    sketch = os.path.join(pkg, "examples", "DemoModelPredict")
+    bp = os.path.join(DEVDIR, "arduino_example", "build")
+    r = subprocess.run(["arduino-cli", "compile", "--fqbn", FQBN, "--library", pkg, "--build-path", bp,
+                        "--build-property", f"compiler.optimization_flag={opt}", sketch],
+                       capture_output=True, text=True, env=_env())
+    if r.returncode != 0:
+        raise DeviceError("building the packaged example failed:\n" + (r.stdout + r.stderr)[-3000:])
+    want = f"class {int(exp.evaluation.int_class[0])}, margins [" + ", ".join(
+        str(int(m)) for m in exp.evaluation.integer[0]) + "]"
+    with locked("board_" + serial):
+        upload(serial, bp)
+        import serial as pyserial
+        lines: List[str] = []
+        end = time.time() + 20
+        port = find_port(serial, wait=30)
+        ser = pyserial.Serial(port, 115200, timeout=1)
+        try:
+            while time.time() < end and len(lines) < 2:
+                ln = ser.readline().decode(errors="replace").strip()
+                if ln:
+                    lines.append(ln)
+        finally:
+            ser.close()
+    ok = bool(lines) and all(want in ln and ln.endswith("self-check OK") for ln in lines)
+    res = {"board": serial, "model": model_name, "lines": lines, "expected": want, "ok": ok}
+    os.makedirs(os.path.join(DEVDIR, "results"), exist_ok=True)
+    with open(os.path.join(DEVDIR, "results", "arduino_example.json"), "w") as f:
+        json.dump(res, f, indent=1)
+    return res
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
+    e = sub.add_parser("example", help="run the packaged Arduino example on a board and check its self-check line")
+    e.add_argument("--board", default="B")
     r = sub.add_parser("run")
     r.add_argument("model")
     r.add_argument("--variant", type=int, default=0)
@@ -492,6 +535,12 @@ def main(argv=None) -> int:
         for name, sn in BOARDS.items():
             print(f"board {name}: {sn} -> {ports.get(sn, 'NOT ATTACHED')}")
         return 0
+    if args.cmd == "example":
+        res = run_packaged_example(args.board)
+        for ln in res["lines"]:
+            print("board says: " + ln)
+        print("packaged Arduino example on the board: " + ("OK" if res["ok"] else f"FAIL (expected '{res['expected']}')"))
+        return 0 if res["ok"] else 1
     if args.cmd == "run":
         res = run_model(args.model, args.variant, args.kind, args.board, args.opt, args.reps, args.rows,
                         args.force_upload)

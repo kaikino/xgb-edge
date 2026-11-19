@@ -163,6 +163,19 @@ def test_baseline_on_cortex_m4_has_no_ram_and_no_library_calls(name, tmp_path):
     assert 0 < sz["text"] < 400
     assert sizes.undefined_symbols(cc[:-3] + "nm", [obj]) == []     # hardware float only, no helpers
 
+    # The node table the cross compiler produced is the model, byte for byte: 8-byte little-endian
+    # records {float32 value, uint16 feature | default-left << 15, uint16 right offset}.
+    value, feat, dleft, right, tree_len, _, _ = float_baseline._layout(model)
+    expected = np.zeros(value.size, dtype=[("value", "<f4"), ("feature_and_flags", "<u2"), ("right", "<u2")])
+    expected["value"] = value
+    expected["feature_and_flags"] = feat | (dleft.astype(np.int64) << 15)
+    expected["right"] = right
+    assert expected.itemsize == 8 and value.size == model.n_internal + model.n_leaves
+    dump = str(tmp_path / "nodes.bin")
+    subprocess.run([cc[:-3] + "objcopy", "-O", "binary", "-j", ".rodata.m_nodes", obj, dump], check=True)
+    assert open(dump, "rb").read() == expected.tobytes()
+    assert int(tree_len.sum()) == value.size and (right[np.cumsum(tree_len) - 1] == 0).all()
+
 
 @needs_cross
 def test_sizes_cli_measures_every_variant(tmp_path):
@@ -189,10 +202,10 @@ def test_compile_watchdog_reports_timeout_memory_and_failure(tmp_path):
     from bench import sizes
     log = str(tmp_path / "log")
     hog = "import time; x = bytearray(400 * 2**20); x[::4096] = b'x' * len(x[::4096]); time.sleep(60)"
-    r = sizes.run_limited([sys.executable, "-c", "import time; time.sleep(60)"], log, timeout=1.5, max_rss=None)
+    r = sizes.run_limited([sys.executable, "-c", "import time; time.sleep(60)"], log, timeout=1.5, max_mem=None)
     assert r["outcome"] == "timeout" and r["seconds"] < 10
-    r = sizes.run_limited(["/bin/sh", "-c", f'{sys.executable} -c "{hog}"; true'], log, timeout=30, max_rss=150 * 2 ** 20)
-    assert r["outcome"] == "memory" and r["seconds"] < 20 and r["peak_rss_bytes"] > 150 * 2 ** 20
+    r = sizes.run_limited(["/bin/sh", "-c", f'{sys.executable} -c "{hog}"; true'], log, timeout=30, max_mem=150 * 2 ** 20)
+    assert r["outcome"] == "memory" and r["seconds"] < 20 and r["peak_mem_bytes"] > 150 * 2 ** 20
     r = sizes.run_limited([sys.executable, "-c", "import sys; sys.exit('x.c:1:1: error: nope')"], log, 30, None)
     assert r["outcome"] == "failed"
     assert sizes.summarize_compiler_log(open(log).read()) == "error: nope"

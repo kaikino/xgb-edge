@@ -11,7 +11,7 @@ import numpy as np
 from . import __version__
 from .export import ExportOptions, export_model
 from .model import XgbEdgeError
-from .report import DEFAULT_CFLAGS, add_flash_totals, find_cross_compiler, measure, render
+from .report import DEFAULT_CFLAGS, TARGETS, add_flash_totals, find_compiler, measure, render
 
 
 def load_matrix(path: str) -> np.ndarray:
@@ -41,6 +41,9 @@ def _parser() -> argparse.ArgumentParser:
         s.add_argument("model", help="XGBoost model saved with save_model('model.json')")
         if cmd == "export":
             s.add_argument("-o", "--out", default=".", help="output directory (default: current)")
+            s.add_argument("--package", choices=["arduino", "zephyr", "esp-idf"],
+                           help="write an Arduino library, Zephyr module or ESP-IDF component with an example "
+                                "into the output directory, instead of the bare .h/.c")
         s.add_argument("--name", default="xgb_model", help="C identifier prefix and file name (default: xgb_model)")
         s.add_argument("--validation", metavar="FILE",
                        help="feature matrix (.npy/.npz/.csv, NaN or empty = missing) used to check tie risk")
@@ -50,9 +53,18 @@ def _parser() -> argparse.ArgumentParser:
                        help="type of the feature array passed to predict (default: f32)")
         s.add_argument("--leaf-store", default="auto", choices=["auto", "inline", "table"],
                        help="store leaf values in the nodes or in a shared table (default: smaller of the two)")
-        s.add_argument("--cc", help="cross compiler used to measure code size and stack "
-                                    "(default: arm-none-eabi-gcc if found)")
-        s.add_argument("--cflags", default=DEFAULT_CFLAGS, help=f"flags for --cc (default: {DEFAULT_CFLAGS})")
+        s.add_argument("--thresholds", default="auto", choices=["auto", "rank", "direct"],
+                       help="threshold encoding: ranks into per-feature cut tables, or keys stored in the "
+                            "nodes (default: smaller of the two)")
+        s.add_argument("--rounds", default="auto",
+                       help="boosting rounds to export: all, best (stop at best_iteration, as "
+                            "XGBClassifier.predict does) or a number; required for early-stopped models")
+        s.add_argument("--target", default="cortex-m4", choices=sorted(TARGETS),
+                       help="target whose compiler measures code size and stack for the report, if that "
+                            "compiler is installed (default: cortex-m4)")
+        s.add_argument("--cc", help="measure with this cross compiler instead of the --target one")
+        s.add_argument("--cflags", help="flags for the measuring compiler (default: the --target flags, "
+                                        f"e.g. {DEFAULT_CFLAGS})")
         s.add_argument("--no-measure", action="store_true", help="do not run a compiler; estimate code size")
         s.add_argument("--report-json", metavar="FILE", help="also write the report as JSON")
     return p
@@ -62,7 +74,7 @@ def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     try:
         opt = ExportOptions(name=args.name, input=args.input, leaf_bits=args.leaf_bits,
-                            leaf_store=args.leaf_store)
+                            leaf_store=args.leaf_store, thresholds=args.thresholds, rounds=args.rounds)
         if opt.leaf_bits != "auto":
             try:
                 opt.leaf_bits = int(opt.leaf_bits)
@@ -72,18 +84,27 @@ def main(argv=None) -> int:
         exp = export_model(args.model, opt, X)
         measured = None
         if not args.no_measure:
-            cc = args.cc or find_cross_compiler()
+            exe, flags = TARGETS[args.target]
+            cc = args.cc or find_compiler(exe)
             if cc:
                 try:
                     measured = measure(exp.generated.header, exp.generated.source, exp.generated.name,
-                                       cc, args.cflags)
+                                       cc, args.cflags if args.cflags is not None else flags)
+                    measured["target"] = args.target
                 except (OSError, RuntimeError) as e:
                     print(f"warning: could not measure with {cc}: {e}", file=sys.stderr)
         add_flash_totals(exp.report, measured)
-        if args.cmd == "export":
+        package = getattr(args, "package", None)
+        if package:
+            from .package import write_package
+            paths = write_package(exp, package, args.out, sample=X)   # the example runs on the first row of X
+        elif args.cmd == "export":
             paths = exp.write(args.out)
         sys.stdout.write(render(exp.report))
-        if args.cmd == "export":
+        if package:
+            print(f"wrote {package} package to {args.out}:\n  "
+                  + "\n  ".join(os.path.relpath(p, args.out) for p in paths))
+        elif args.cmd == "export":
             print("wrote " + ", ".join(paths))
         if args.report_json:
             with open(args.report_json, "w") as f:

@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 
-from .analysis import Evaluation, evaluate, margin_gap
+from .analysis import Evaluation, evaluate, integer_gap, margin_gap, safe_gap
 from .codegen import Generated, check_name, generate
 from .model import Model, UnsupportedModelError, XgbEdgeError, load
 from .pack import TYPE_NAMES, Packed, pack
@@ -42,6 +42,7 @@ class Export:
     generated: Generated
     evaluation: Optional[Evaluation]
     report: Dict = field(default_factory=dict)
+    safe_gap: int = 0      # fixed-point margin gap that guarantees XGBoost's class (the <NAME>_SAFE_GAP macro)
 
     def write(self, outdir) -> List[str]:
         os.makedirs(outdir, exist_ok=True)
@@ -190,7 +191,12 @@ def export_model(model: Union[Model, str, os.PathLike], options: Optional[Export
     # Threshold encoding: build the candidates and keep the smaller model.
     best = None
     for mode in (("rank", "direct") if opt.thresholds == "auto" else (opt.thresholds,)):
-        tp = plan_thresholds(model, opt.input, mode)
+        try:
+            tp = plan_thresholds(model, opt.input, mode)
+        except UnsupportedModelError:
+            if opt.thresholds == "auto" and mode == "rank":
+                continue   # e.g. more thresholds on one feature than a rank can count: direct still works
+            raise
         if mode == "rank":
             tp.code_bytes = max(tp.code_bytes, opt.min_code_bytes)
         pk = pack(model, tp, lplan, leaf_store=opt.leaf_store, min_hdr_bytes=opt.min_hdr_bytes,
@@ -204,9 +210,10 @@ def export_model(model: Union[Model, str, os.PathLike], options: Optional[Export
         f"{model.n_features} features ({len(tplan.used_features)} used), {model.n_classes} classes.",
         f"Leaves: {lplan.bits}-bit fixed point, margins scaled by 2^{lplan.shift}.",
     ]
-    gen = generate(model, tplan, lplan, packed, opt.name, summary)
+    gap = safe_gap(model, lplan)
+    gen = generate(model, tplan, lplan, packed, opt.name, summary, safe_gap=gap)
     exp = Export(model=model, options=opt, tplan=tplan, lplan=lplan, packed=packed,
-                 generated=gen, evaluation=evaluation)
+                 generated=gen, evaluation=evaluation, safe_gap=gap)
     exp.report = build_report(exp, notes)
     return exp
 
@@ -284,6 +291,8 @@ def build_report(exp: Export, notes: List[str]) -> Dict:
             "worst_case_margin_error": float(lp.worst_error.max()),
             "error_range_per_class": [[float(a), float(b)] for a, b in zip(lp.err_lo, lp.err_hi)],
             "max_abs_accumulator": int(max(lp.max_abs_acc)),
+            "safe_gap": int(exp.safe_gap),
+            "safe_gap_margin_units": exp.safe_gap * lp.lsb,
         },
         "notes": list(notes),
     }
@@ -305,6 +314,7 @@ def build_report(exp: Export, notes: List[str]) -> Dict:
             "class_differs_from_exact_arithmetic": int(ev.differs_from_exact.sum()),
             "differs_indices": [int(i) for i in np.nonzero(ev.differs_from_exact)[0]],
             "smallest_margin_gap": float(gaps.min()) if gaps.size else None,
+            "within_safe_gap": int((integer_gap(ev.integer, model.is_binary) <= exp.safe_gap).sum()),
             "xgboost_float32_noise_bound_max": float(sh.float_noise.max()) if sh.float_noise.size else 0.0,
             "tree_comparisons_mean": float(sh.path_len.mean()) if ev.n else 0.0,
             "tree_comparisons_max": int(sh.path_len.max()) if ev.n else 0,

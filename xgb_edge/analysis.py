@@ -153,6 +153,60 @@ def evaluate(model: Model, plans: Sequence[LeafPlan], X, chunk: int = 4096) -> L
     return out
 
 
+def static_float_noise(model: Model) -> np.ndarray:
+    """Per group: a bound, valid for *every* input, on |XGBoost's float32 margin - exact margin|.
+
+    Same reasoning as the per-sample bound in :func:`evaluate`, but with each
+    partial sum replaced by the largest magnitude it can have for any path
+    through the trees.  Looser than the per-sample bound, but it needs no data.
+    """
+    G = model.n_groups
+    base = model.base_margin.astype(np.float64)
+    prods = leaf_products(model)
+    hi = np.zeros(G)
+    lo = np.zeros(G)
+    acc = np.zeros(G)
+    abs_sum = np.zeros(G)
+    for t, p in zip(model.trees, prods):
+        g = t.group
+        leaves = p[t.leaf_nodes]
+        pmax, pmin = float(leaves.max()), float(leaves.min())
+        hi[g] += pmax
+        lo[g] += pmin
+        biggest = max(abs(hi[g] + base[g]), abs(lo[g] + base[g]), abs(hi[g]), abs(lo[g]))
+        acc[g] += biggest + max(abs(pmax), abs(pmin))
+        abs_sum[g] += max(abs(pmax), abs(pmin))
+    total = np.maximum(np.abs(hi + base), np.abs(lo + base))
+    ulp_base = np.array([float(np.spacing(np.float32(abs(b)))) for b in model.base_margin])
+    return 1.01 * U32 * (acc + total) + model.base_margin_ulps * ulp_base \
+        + 1e-15 * (abs_sum + np.abs(base)) + len(model.trees) * 2.0 ** -149
+
+
+def safe_gap(model: Model, plan: LeafPlan) -> int:
+    """Fixed-point margin gap above which the integer class provably equals XGBoost's, for any input.
+
+    If the winning integer margin exceeds every other one by more than this
+    (binary: if |margin| exceeds it), then the exact margins are far enough
+    apart that neither our leaf rounding nor XGBoost's own float32 rounding
+    can change the winner.
+    """
+    noise = static_float_noise(model)
+    if model.is_binary:
+        need = max(float(plan.err_hi[0]), -float(plan.err_lo[0]), 0.0) + float(noise[0]) + DECISION_SLACK
+    else:
+        need = float(plan.err_hi.max() - plan.err_lo.min()) + 2.0 * float(noise.max()) + DECISION_SLACK
+    g = math.ceil(need * math.ldexp(1.0, plan.shift) * (1.0 + 1e-9)) + 1
+    return int(min(g, 2 ** 31 - 1))
+
+
+def integer_gap(integer: np.ndarray, binary: bool) -> np.ndarray:
+    """What a caller compares with SAFE_GAP: winning margin minus the runner-up (binary: |margin|)."""
+    if binary:
+        return np.abs(integer[:, 0])
+    part = np.partition(integer, -2, axis=1)
+    return part[:, -1] - part[:, -2]
+
+
 def margin_gap(exact: np.ndarray, binary: bool) -> np.ndarray:
     """Distance of each sample from a tie, in margin units."""
     if binary:

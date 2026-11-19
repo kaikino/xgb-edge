@@ -38,7 +38,7 @@ from harness import zoo  # noqa: E402
 from xgb_edge import ExportOptions, export_model, load  # noqa: E402
 from xgb_edge.quantize import INPUT_KINDS  # noqa: E402
 from xgb_edge.refsim import leaf_indices  # noqa: E402
-from xgb_edge.report import find_cross_compiler, measure  # noqa: E402
+from xgb_edge.report import available_targets, find_cross_compiler, measure  # noqa: E402
 
 BUILD = os.path.join(zoo.ROOT, "build", "parity")
 
@@ -166,6 +166,15 @@ def check_variant(tr: zoo.Trained, model, opts: Dict, workdir: str, cross_cc: Op
     if unflagged.any():
         fails.append(f"{int(unflagged.sum())} rows differ from xgboost without having been flagged "
                      f"(first: row {sel[np.nonzero(unflagged)[0][0]]})")
+    # the run-time certainty check: a margin gap above SAFE_GAP must always mean xgboost's class
+    from xgb_edge.analysis import integer_gap
+    certain = integer_gap(c_margin, model.is_binary) > exp.safe_gap
+    if (differ & certain).any():
+        fails.append(f"{int((differ & certain).sum())} rows differ from xgboost although their margin gap "
+                     f"exceeds SAFE_GAP ({exp.safe_gap})")
+    if f"_SAFE_GAP {exp.safe_gap}L" not in exp.generated.header:
+        fails.append("SAFE_GAP macro missing from the header")
+    res["uncertain"] = int((~certain).sum())
     # where xgboost's own rounding cannot matter, xgboost must agree with exact arithmetic
     if (xgb_class[~sh.float_risk] != sh.ref_class[~sh.float_risk]).any():
         fails.append("xgboost disagrees with exact arithmetic on a row not flagged for float32 noise")
@@ -178,18 +187,22 @@ def check_variant(tr: zoo.Trained, model, opts: Dict, workdir: str, cross_cc: Op
     if (c_cmp < floor).any():
         fails.append("fewer comparisons counted than tree splits visited")
 
-    # cross-compile for Cortex-M4: no warnings, and .rodata equals the reported data size
+    # cross-compile with -Wall -Wextra -Werror for the nRF52840 (Cortex-M4) and the ESP32s
+    # (Xtensa and RISC-V): no warnings, and .rodata equals the reported data size
     if cross_cc:
-        try:
-            m = measure(exp.generated.header, exp.generated.source, "m", cross_cc)
-            res["arm_code"] = m["code_bytes"]
-            res["arm_stack"] = m["stack_bytes"]
-            if m["rodata_bytes"] != rep["flash"]["data_bytes"]:
-                fails.append(f"reported data size {rep['flash']['data_bytes']} != .rodata {m['rodata_bytes']}")
-            if m["static_ram_bytes"] != 0:
-                fails.append(f"generated code uses {m['static_ram_bytes']} bytes of static RAM")
-        except RuntimeError as e:
-            fails.append("Cortex-M4 compile failed or warned: " + str(e)[-400:])
+        for target, (cc, flags) in available_targets().items():
+            if target == "avr":
+                continue   # 8-bit AVR is checked separately, on models small enough to exist there
+            try:
+                m = measure(exp.generated.header, exp.generated.source, "m", cc, flags)
+                res[f"code_{target}"] = m["code_bytes"]
+                res[f"stack_{target}"] = m["stack_bytes"]
+                if m["rodata_bytes"] != rep["flash"]["data_bytes"]:
+                    fails.append(f"{target}: reported data size {rep['flash']['data_bytes']} != .rodata {m['rodata_bytes']}")
+                if m["static_ram_bytes"] != 0:
+                    fails.append(f"{target}: generated code uses {m['static_ram_bytes']} bytes of static RAM")
+            except RuntimeError as e:
+                fails.append(f"{target} compile failed or warned: " + str(e)[-400:])
 
     held = sel < tr.n_heldout
     res.update({
@@ -310,6 +323,9 @@ def main(argv=None) -> int:
           f"{len(rows) - len(failed)} ok, {len(failed)} failed; "
           f"{flagged} rows flagged at risk in advance, {differ} of those actually differ from xgboost, "
           f"{sum(r.get('differ_unflagged', 0) for r in rows)} unflagged differences")
+    targets = [t for t in available_targets() if t != "avr"]
+    print(f"each export also compiled with -Wall -Wextra -Werror for: host (clang, + -Wpedantic -Wconversion), "
+          f"{', '.join(targets) if targets else 'no cross compilers found'}")
     os.makedirs(BUILD, exist_ok=True)
     with open(os.path.join(BUILD, "summary.json"), "w") as f:
         json.dump(rows, f, indent=1)
