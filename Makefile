@@ -24,7 +24,7 @@ device:
 
 device-float:
 	$(PY) -m harness.device suite --board B --kind float bin_d2_r5_hist mc3_d3_r10_hist \
-	    mc5_d4_r50_hist_missing bin_d6_r200_exact_missing mc10_digits_d6_r100_hist
+	    mc5_d4_r50_hist_missing bin_d6_r200_exact_missing mc10_digits_d6_r100_hist mc3_dart mc4_int16
 
 example:
 	$(PY) -m harness.device example --board B

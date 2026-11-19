@@ -19,7 +19,7 @@ repository rather than assumed:
    possible input. Leaf values are rounded to fixed point; the tool reports
    the worst-case effect of that rounding and tells you, before anything is
    flashed, which of your validation rows are close enough to a tie for the
-   class to change. On the 29 test models here the generated C predicted
+   class to change. On the 30 test models here the generated C predicted
    XGBoost's class on every row that the tool had not flagged in advance.
 
 The numbers in this README say where they were measured: on a real nRF52840,
@@ -60,10 +60,18 @@ float features[GESTURE_NUM_FEATURES];   /* same order and values as the training
 int32_t margins[GESTURE_NUM_MARGINS];
 
 int cls = gesture_predict(features, margins);        /* margins may be NULL */
+```
 
-if (margins[cls] - second_largest(margins) > GESTURE_SAFE_GAP) {
-    /* optional: this prediction is guaranteed to be XGBoost's */
+Optionally, check how clear the decision was. If the winner beats every
+other class by more than `GESTURE_SAFE_GAP`, the class is guaranteed to be
+the one XGBoost predicts for this input:
+
+```c
+int certain = 1;
+for (int k = 0; k < GESTURE_NUM_MARGINS; k++) {
+    if (k != cls && margins[cls] - margins[k] <= GESTURE_SAFE_GAP) certain = 0;
 }
+/* binary model: certain = margins[0] > NAME_SAFE_GAP || margins[0] < -NAME_SAFE_GAP */
 ```
 
 * The return value is the class index, `0 .. NUM_CLASSES-1`.
@@ -480,7 +488,7 @@ To repeat the hardware runs (two XIAO nRF52840 boards, serial numbers in
 ```sh
 python -m harness.device suite --board A                 # xgb-edge, every row, timing
 python -m harness.device suite --board B --kind float bin_d2_r5_hist mc3_d3_r10_hist \
-    mc5_d4_r50_hist_missing bin_d6_r200_exact_missing mc10_digits_d6_r100_hist
+    mc5_d4_r50_hist_missing bin_d6_r200_exact_missing mc10_digits_d6_r100_hist mc3_dart mc4_int16
 python -m harness.device example --board B               # the packaged Arduino example
 python -m bench.sizes --tl2cgen-parallel-comp 32         # flash sizes of the alternatives
 python -m harness.build_packages                         # Arduino, ESP-IDF and Zephyr builds
