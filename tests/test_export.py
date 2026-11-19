@@ -222,7 +222,7 @@ def test_huge_margins_still_fit_the_accumulator(tmp_path):
     res = check_synthetic(path, X, {"leaf_bits": 32}, str(tmp_path))
     assert res["failures"] == []
     exp = export_model(path, ExportOptions(leaf_bits=32))
-    assert max(exp.lplan.max_abs_acc) <= 2 ** 31 - 1
+    assert max(exp.lplan.max_abs_acc) <= 2 ** 30 - 1      # so that margin differences fit in int32 too
 
 
 def test_tables_with_identical_contents_are_shared_and_still_referenced(tmp_path):

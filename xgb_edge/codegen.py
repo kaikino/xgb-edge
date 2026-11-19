@@ -160,7 +160,8 @@ def generate(model: Model, tp: ThresholdPlan, lp: LeafPlan, pk: Packed, name: st
         ret_doc = (f"Returns the predicted class 0..{model.n_classes - 1}: the index of the largest margin "
                    "(lowest index on ties).")
         m_doc = (f"If margins is not NULL, margins[k] receives the summed margin of class k in\n"
-                 f" * fixed point: real value = margins[k] / 2^{P}_MARGIN_SHIFT.")
+                 f" * fixed point: real value = margins[k] / 2^{P}_MARGIN_SHIFT. Margins stay within\n"
+                 " * +/-(2^30 - 1), so the difference of two margins cannot overflow an int32_t.")
     if model.is_binary:
         gap_doc = (f"/* Certainty check, in the same fixed point as the margins. If margins[0] is\n"
                    f" * above {P}_SAFE_GAP or below -{P}_SAFE_GAP, the predicted class is guaranteed\n"

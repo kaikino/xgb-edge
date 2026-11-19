@@ -298,7 +298,9 @@ def plan_thresholds(model: Model, input_kind: str = "f32", mode: str = "rank") -
 
 # --------------------------------------------------------------------------- leaves
 
-INT32_MAX = 2 ** 31 - 1
+#: Largest |margin| the scale is allowed to produce.  One bit below int32 so that the
+#: difference of any two margins (used for the SAFE_GAP check) cannot overflow either.
+ACC_MAX = 2 ** 30 - 1
 MAX_SHIFT = 62
 
 
@@ -383,19 +385,19 @@ def plan_leaves(model: Model, bits: int = 16) -> LeafPlan:
     else:
         s = 16  # no stored leaves (or all zero): only the bias needs a scale
 
-    # ... and for which no accumulator can overflow int32.
+    # ... and for which no accumulator can leave [-ACC_MAX, ACC_MAX].
     while True:
         q, max_q_tree, bias = _quantize_at(model, prods, const_real, s)
         acc = [abs(b) for b in bias]
         for t, c, mq in zip(model.trees, constant, max_q_tree):
             if not c:
                 acc[t.group] += mq
-        if max(acc) <= INT32_MAX:
+        if max(acc) <= ACC_MAX:
             break
         s -= 1
         if s < 0:
             raise UnsupportedModelError(
-                "the summed margins can exceed the int32 range even with no fractional bits "
+                "the summed margins can exceed the 31-bit accumulator range even with no fractional bits "
                 f"(worst-case |margin| about {max(acc):g}).")
 
     # Exact error bounds.  e = q / 2**s - product is exactly representable in float64.
