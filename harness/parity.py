@@ -113,7 +113,7 @@ def rows_for_input(X: np.ndarray, input_kind: str) -> np.ndarray:
 def variant_label(opts: Dict) -> str:
     if not opts:
         return "auto"
-    return ",".join(f"{k.replace('min_', '').replace('_bytes', 'B').replace('leaf_', 'l')}={v}"
+    return ",".join(f"{k.replace('min_', '').replace('_bytes', 'B').replace('leaf_', 'l').replace('thresholds', 'thr')}={v}"
                     for k, v in opts.items())
 
 
@@ -194,7 +194,7 @@ def check_variant(tr: zoo.Trained, model, opts: Dict, workdir: str, cross_cc: Op
     held = sel < tr.n_heldout
     res.update({
         "leaf_bits": lp.bits, "shift": lp.shift, "layout": f"{exp.packed.hdr_bytes}{exp.packed.code_bytes}"
-        f"{exp.packed.off_bytes}{exp.packed.leaf_bytes}{exp.packed.leaf_mode[0]}",
+        f"{exp.packed.off_bytes}{exp.packed.leaf_bytes}{exp.packed.leaf_mode[0]}{exp.tplan.mode[0]}",
         "data_bytes": rep["flash"]["data_bytes"],
         "bytes_per_split": rep["layout"]["bytes_per_split"],
         "at_risk": int(ev.at_risk.sum()), "at_risk_quant": int(ev.quant_risk.sum()),
@@ -264,7 +264,7 @@ def check_spec(name: str, only_variant: Optional[int] = None) -> List[Dict]:
 
 def print_table(rows: List[Dict]) -> None:
     cols = [("model", 28), ("variant", 30), ("K", 3), ("trees", 6), ("splits", 8), ("rows", 6), ("bits", 4),
-            ("layout", 6), ("data B", 9), ("B/split", 7), ("risk", 5), ("differ", 6), ("unflagged", 9), ("result", 6)]
+            ("layout", 7), ("data B", 9), ("B/split", 7), ("risk", 5), ("differ", 6), ("unflagged", 9), ("result", 6)]
     print(" ".join(f"{c:<{w}}" if i < 2 else f"{c:>{w}}" for i, (c, w) in enumerate(cols)))
     for r in rows:
         ok = not r["failures"]

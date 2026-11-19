@@ -37,7 +37,8 @@ from xgb_edge.report import find_cross_compiler, measure  # noqa: E402
 
 FQBN = "Seeeduino:nrf52:xiaonRF52840SensePlus"
 BOARDS = {"A": "C8B9EFDEFE7136C7", "B": "9857559A47B38970"}
-FLASH_MAX = 811008
+FLASH_MAX_CORE = 811008     # what the Arduino core's boards.txt advertises
+FLASH_MAX = 798720          # what the bootloader really accepts over DFU (measured: see harness/flash_limit.py)
 SKETCH = os.path.join(zoo.ROOT, "firmware", "xgbe_bench")
 DEVDIR = os.path.join(zoo.ROOT, "build", "device")
 CORTEX_FLAGS = "-mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16"
@@ -112,15 +113,18 @@ int mut_predict(const void *features, void *margins);
 
 
 def make_sketch(tag: str, files: Dict[str, str], nf: int, nm: int, feat_bytes: int, margin_float: bool,
-                mut_body: str) -> Tuple[str, int]:
+                mut_body: str, pad_bytes: int = 0) -> Tuple[str, int]:
     """Copy the firmware sketch to build/device/<tag>/ and add the model under test."""
     d = os.path.join(DEVDIR, tag, "xgbe_bench")
     os.makedirs(d, exist_ok=True)
-    blob = "".join(files[k] for k in sorted(files)) + mut_body + open(os.path.join(SKETCH, "xgbe_bench.ino")).read()
+    blob = "".join(files[k] for k in sorted(files)) + mut_body + open(os.path.join(SKETCH, "xgbe_bench.ino")).read() \
+        + str(pad_bytes)
     build_id = zlib.crc32(blob.encode()) & 0xFFFFFFFF
     wanted = dict(files)
     wanted["xgbe_bench.ino"] = open(os.path.join(SKETCH, "xgbe_bench.ino")).read()
     wanted["mut.h"] = MUT_H.format(nf=nf, nm=nm, fb=feat_bytes, isf=int(margin_float), bid=build_id)
+    if pad_bytes:
+        wanted["mut.h"] = wanted["mut.h"].replace("#endif", f"#define MUT_PAD_BYTES {pad_bytes}\n#endif")
     wanted["mut.c"] = mut_body
     for stale in os.listdir(d):
         if stale not in wanted:
@@ -175,7 +179,7 @@ def upload(serial: str, build_path: str, retries: int = 3) -> None:
             r = subprocess.run(["arduino-cli", "upload", "-p", port, "--fqbn", FQBN, "--input-dir", build_path],
                                capture_output=True, text=True, env=_env())
         last = r.stdout + r.stderr
-        if r.returncode == 0:
+        if r.returncode == 0 and "Failed to upgrade target" not in last:
             time.sleep(1.5)
             if find_port(serial, wait=30):
                 return
@@ -398,6 +402,10 @@ def run_model(model_name: str, variant: int = 0, kind: str = "xgbe", board: str 
     log(f"[{model_name} {res['variant']} on {board}] compiling ({opt}) ...")
     build = compile_sketch(sketch, opt)
     res["build"] = {k: build[k] for k in ("program_bytes", "max_bytes", "ram_bytes", "compile_seconds", "warnings")}
+    res["build"]["bootloader_limit"] = FLASH_MAX
+    if build["program_bytes"] and build["program_bytes"] > FLASH_MAX:
+        raise DeviceError(f"firmware is {build['program_bytes']} bytes; the bootloader accepts at most {FLASH_MAX} "
+                          f"(the Arduino core's limit of {FLASH_MAX_CORE} is not reachable over DFU)")
     if build["warnings"]:
         fails.append("compiler warnings in generated/harness files: " + "; ".join(build["warnings"][:3]))
     syms = elf_symbols(build["elf"], MODEL_NAME + "_")

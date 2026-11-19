@@ -20,6 +20,15 @@ that orders the same way floats do (-0.0 and +0.0 share key 0); NaN is the
 missing value.  For integer inputs the key is the integer itself and the cut
 is the smallest integer ``n`` whose float32 value is ``>= t``.
 
+That is the "rank" encoding.  When nearly every split has its own threshold
+(models trained with tree_method="exact"), a table of cuts costs more than it
+saves, so there is a second, "direct" encoding: the node stores the threshold
+key itself and is compared with the feature's key (both biased to unsigned so
+one unsigned compare works for every type).  For integer inputs this is the
+classic picture: an int8/int16 feature is compared with an int8/int16
+threshold, which is the smallest integer whose float32 value is >= t.  The
+exporter picks whichever encoding makes the model smaller.
+
 Missing values need no flag in the node: a feature gets up to two "slots"
 holding its rank.  In the default-right slot a missing value is stored as the
 largest code (never ``< code``), in the default-left slot as 0 (always
@@ -122,6 +131,15 @@ class ThresholdPlan:
     code_bytes: int                # 1 or 2: width of a rank / threshold code
     node_slot: List[np.ndarray]    # per tree: slot of each node (valid for internal nodes)
     node_code: List[np.ndarray]    # per tree: threshold code of each node (internal nodes)
+    mode: str = "rank"             # "rank": codes are ranks in the cut tables; "direct": codes are biased keys
+    const_slot: Optional[int] = None  # direct mode, integer inputs: slot that always holds 0 (for always-left splits)
+
+    @property
+    def key_bias(self) -> int:
+        """Direct mode: value added to a key to make it unsigned (stored code = key + bias)."""
+        if self.input_kind.is_float:
+            return 1 << 31
+        return -self.input_kind.lo
 
     @property
     def n_right_slots(self) -> int:
@@ -146,10 +164,13 @@ class ThresholdPlan:
         return None
 
 
-def plan_thresholds(model: Model, input_kind: str = "f32") -> ThresholdPlan:
+def plan_thresholds(model: Model, input_kind: str = "f32", mode: str = "rank") -> ThresholdPlan:
     if input_kind not in INPUT_KINDS:
         raise XgbEdgeError(f"unknown input kind {input_kind!r}; choose one of {', '.join(INPUT_KINDS)}")
+    if mode not in ("rank", "direct"):
+        raise XgbEdgeError(f"threshold mode must be rank or direct, got {mode!r}")
     kind = INPUT_KINDS[input_kind]
+    direct = mode == "direct"
 
     # Gather every split of every tree.
     t_idx, n_idx, feats, thrs, dls = [], [], [], [], []
@@ -165,7 +186,7 @@ def plan_thresholds(model: Model, input_kind: str = "f32") -> ThresholdPlan:
     node_slot = [np.full(t.left.size, -1, dtype=np.int64) for t in model.trees]
     node_code = [np.full(t.left.size, -1, dtype=np.int64) for t in model.trees]
     if not t_idx:
-        return ThresholdPlan(kind, [], 0, 0, 0, [], 0, 1, node_slot, node_code)
+        return ThresholdPlan(kind, [], 0, 0, 0, [], 0, 1, node_slot, node_code, mode)
     t_idx = np.concatenate(t_idx)
     n_idx = np.concatenate(n_idx)
     feats = np.concatenate(feats)
@@ -176,8 +197,21 @@ def plan_thresholds(model: Model, input_kind: str = "f32") -> ThresholdPlan:
     feature_ids = [int(f) for f in np.unique(feats)]
     cuts_by_feature: Dict[int, np.ndarray] = {}
     max_code = 0
+    always_left_node = np.zeros(feats.size, dtype=bool)   # direct mode, integer inputs
     for f in feature_ids:
         idx = np.nonzero(feats == f)[0]
+        if direct:
+            cuts_by_feature[f] = np.zeros(0, dtype=np.int64)
+            if kind.is_float:
+                # biased key: [0x00800000, 0xFF800000], so 0 and 0xFFFFFFFF are free for missing values
+                codes[idx] = f32_key(thrs[idx]) + (1 << 31)
+            else:
+                uniq, inv = np.unique(thrs[idx], return_inverse=True)
+                cut_of = np.array([int_cut(float(t), kind.lo, kind.hi) for t in uniq], dtype=np.int64)
+                # go left iff n < cut  <=>  (n - lo) < (cut - lo); cut == hi + 1 does not fit the type
+                always_left_node[idx] = (cut_of > kind.hi)[inv]
+                codes[idx] = np.where(cut_of > kind.hi, 1, cut_of - kind.lo)[inv]
+            continue
         if kind.is_float:
             keys = f32_key(thrs[idx])
             cuts = np.unique(keys)
@@ -204,7 +238,9 @@ def plan_thresholds(model: Model, input_kind: str = "f32") -> ThresholdPlan:
         cuts_by_feature[f] = cuts.astype(np.int64)
         max_code = max(max_code, top)
 
-    if max_code <= 0xFF:
+    if direct:
+        code_bytes = kind.cut_bytes
+    elif max_code <= 0xFF:
         code_bytes = 1
     elif max_code <= 0xFFFF:
         code_bytes = 2
@@ -226,10 +262,14 @@ def plan_thresholds(model: Model, input_kind: str = "f32") -> ThresholdPlan:
     r_only = [f for f in feature_ids if has_dr[f] and not has_dl[f]]
     l_only = [f for f in feature_ids if has_dl[f] and not has_dr[f]]
     used = both + r_only + l_only
+    n_slots = 2 * len(both) + len(r_only) + len(l_only)
+    const_slot = None
+    if always_left_node.any():
+        const_slot = n_slots   # a slot that always holds 0, compared against code 1
+        n_slots += 1
     plan = ThresholdPlan(kind, used, len(both), len(r_only), len(l_only),
-                         [cuts_by_feature[f] for f in used],
-                         2 * len(both) + len(r_only) + len(l_only), code_bytes,
-                         node_slot, node_code)
+                         [cuts_by_feature[f] for f in used], n_slots, code_bytes,
+                         node_slot, node_code, mode, const_slot)
     if plan.n_slots > 16384:
         raise UnsupportedModelError(
             f"the model needs {plan.n_slots} feature slots; at most 16384 are supported.")
@@ -243,7 +283,12 @@ def plan_thresholds(model: Model, input_kind: str = "f32") -> ThresholdPlan:
         slots = np.where(dls, l_slot[fpos], r_slot[fpos])
     else:
         slots = r_slot[fpos]
+    if const_slot is not None:
+        slots = np.where(always_left_node, const_slot, slots)
     assert (slots >= 0).all()
+    assert codes.min() >= 0 and codes.max() < (1 << (8 * code_bytes))
+    if direct and kind.is_float:
+        assert codes.min() > 0 and codes.max() < plan.missing_right_code
     for ti in np.unique(t_idx):
         m = t_idx == ti
         node_slot[ti][n_idx[m]] = slots[m]

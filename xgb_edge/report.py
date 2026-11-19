@@ -112,7 +112,9 @@ def render(rep: Dict) -> str:
     if "code_bytes" in fl:
         L.append(f"  {'interpreter code':<54}{_n(fl['code_bytes']):>10} B  ({fl['code_source']})")
         L.append(f"  {'total':<54}{_n(fl['total_bytes']):>10} B")
-    L.append(f"  layout: {lay['header_bytes']}-byte header, {lay['threshold_code_bytes']}-byte threshold code, "
+    enc = ("thresholds stored in the nodes" if lay.get("threshold_encoding") == "direct"
+           else f"thresholds as ranks into {lay['cuts']} cuts")
+    L.append(f"  layout: {enc}; {lay['header_bytes']}-byte header, {lay['threshold_code_bytes']}-byte threshold code, "
              f"{lay['offset_bytes']}-byte offsets, leaves {lay['leaf_store']} "
              f"({lay['leaf_operand_bytes']}-byte operand"
              + (f", {lay['leaf_table_entries']} table entries x {lay['leaf_table_entry_bytes']} B"
@@ -129,8 +131,11 @@ def render(rep: Dict) -> str:
         L.append(f"  stack during predict: rank array of {ram['rank_array_bytes']} B plus a few words of locals")
     L.append("")
     L.append("Worst-case comparisons per inference")
-    L.append(f"  feature ranking (binary search{' + NaN test' if rep['input'] == 'f32' else ''}): "
-             f"{_n(cmp_['feature_ranking'])}")
+    if lay.get("threshold_encoding") == "direct":
+        L.append(f"  feature preparation (NaN tests): {_n(cmp_['feature_ranking'])}")
+    else:
+        L.append(f"  feature ranking (binary search{' + NaN test' if rep['input'] == 'f32' else ''}): "
+                 f"{_n(cmp_['feature_ranking'])}")
     L.append(f"  tree splits (sum of tree depths): {_n(cmp_['tree_splits'])}")
     L.append(f"  class selection: {cmp_['argmax']}")
     L.append(f"  total: {_n(cmp_['total'])}")

@@ -30,6 +30,11 @@ static uint8_t tx[MAX_PAYLOAD + 8] __attribute__((aligned(4)));
 static uint32_t rowbuf[(ROW_BYTES + 3) / 4 + 1];
 static uint32_t marginbuf[MUT_NUM_MARGINS + 1];
 
+// Optional ballast, used only to find out how large an image the bootloader accepts.
+#ifdef MUT_PAD_BYTES
+static const uint8_t flash_pad[MUT_PAD_BYTES] = {0xA5};
+#endif
+
 static uint16_t crc16(const uint8_t *p, size_t n, uint16_t crc) {
   while (n--) {
     crc ^= (uint16_t)(*p++) << 8;
@@ -104,6 +109,9 @@ static void do_info(uint8_t seq) {
   p[5] = MUT_FEATURE_BYTES;
   p[6] = MUT_MARGIN_IS_FLOAT;
   p[7] = 0;
+#ifdef MUT_PAD_BYTES
+  p[7] = ((const volatile uint8_t *)flash_pad)[MUT_PAD_BYTES - 1];
+#endif
   uint16_t nf = MUT_NUM_FEATURES, nm = MUT_NUM_MARGINS, mp = MAX_PAYLOAD;
   memcpy(p + 8, &nf, 2);
   memcpy(p + 10, &nm, 2);

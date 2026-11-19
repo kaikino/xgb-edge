@@ -180,6 +180,7 @@ def test_c_reaches_the_same_leaf_as_xgboost_at_boundaries(data):
                                chain=data.draw(st.booleans())) for g in range(groups)]
     synth.number_leaves(trees)
     opts = dict(leaf_bits=32,
+                thresholds=data.draw(st.sampled_from(["rank", "direct", "auto"]), label="thresholds"),
                 min_code_bytes=data.draw(st.sampled_from([1, 2])),
                 min_hdr_bytes=data.draw(st.sampled_from([1, 2])),
                 min_off_bytes=data.draw(st.sampled_from([1, 2, 3])),
@@ -203,7 +204,7 @@ def test_integer_inputs_reach_the_same_leaf_as_xgboost(data):
     near = st.one_of(
         st.integers(lo - 3, hi + 3).map(float),
         st.integers(lo - 3, hi + 3).map(lambda n: n + 0.5),
-        st.floats(min_value=float(lo) - 4, max_value=float(hi) + 4, width=32),
+        st.floats(min_value=float(F32(lo - 4)), max_value=float(F32(hi + 4)), width=32),
         st.sampled_from([float(lo), float(hi), 0.0, -0.0, 0.5, -0.5, float(hi) + 1, float(lo) - 1, 1e30, -1e30,
                          2.0 ** 24, 2.0 ** 24 + 2, 2.0 ** 31, -(2.0 ** 31)]),
     )
@@ -233,6 +234,7 @@ def test_integer_inputs_reach_the_same_leaf_as_xgboost(data):
         path = synth.write_model(os.path.join(d, "m.json"), trees, n_features, n_classes)
         _, _, xgb_leaf = synth.xgb_reference(path, X)
         exp = export_model(path, ExportOptions(name="m", input=kind, leaf_bits=32,
+                                               thresholds=data.draw(st.sampled_from(["rank", "direct"]), label="thresholds"),
                                                min_code_bytes=data.draw(st.sampled_from([1, 2]))))
         exe = compile_host(exp, d)
         dev = Xi.astype({"i8": np.int8, "u8": np.uint8, "i16": np.int16, "u16": np.uint16, "i32": np.int32}[kind])
@@ -263,6 +265,7 @@ def test_forests_with_boundary_inputs_pass_the_full_parity_check(data):
             trees.append(t)
     rng.shuffle(trees)
     opts = dict(leaf_bits=data.draw(st.sampled_from([8, 12, 16, 24, 32])),
+                thresholds=data.draw(st.sampled_from(["rank", "direct", "auto"]), label="thresholds"),
                 leaf_store=data.draw(st.sampled_from(["auto", "inline", "table"])),
                 min_code_bytes=data.draw(st.sampled_from([1, 2])),
                 min_hdr_bytes=data.draw(st.sampled_from([1, 2])),
@@ -289,8 +292,9 @@ def test_infinite_inputs_and_thresholds_follow_float_semantics():
     X = np.array([[a, b] for a in vals for b in vals], dtype=F32)
     with tempfile.TemporaryDirectory() as d:
         path = synth.write_model(os.path.join(d, "m.json"), [t], 2, 2)
-        exp = export_model(path, ExportOptions(name="m", leaf_bits=32))
-        exe = compile_host(exp, d)
-        _, c_margin, _, _ = run_host(exe, X, 1)
         ref = leaf_indices(load(path), X)
-    assert np.array_equal(_leaf_ids_from_c(exp, c_margin), ref)
+        for mode in ("rank", "direct"):
+            exp = export_model(path, ExportOptions(name="m", leaf_bits=32, thresholds=mode))
+            exe = compile_host(exp, os.path.join(d, mode))
+            _, c_margin, _, _ = run_host(exe, X, 1)
+            assert np.array_equal(_leaf_ids_from_c(exp, c_margin), ref), mode

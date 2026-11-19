@@ -24,6 +24,7 @@ class ExportOptions:
     leaf_bits: Union[str, int] = "auto"   # "auto" or 2..32
     leaf_store: str = "auto"              # auto, inline, table
     rounds: Union[str, int] = "auto"      # auto, all, best, or a number of boosting rounds
+    thresholds: str = "auto"              # auto, rank (cut tables + ranks), direct (threshold keys in the nodes)
     # Test hooks: force wider fields than the model needs, to exercise every code path.
     min_code_bytes: int = 1
     min_hdr_bytes: int = 1
@@ -140,10 +141,12 @@ def export_model(model: Union[Model, str, os.PathLike], options: Optional[Export
     notes: List[str] = []
     model = select_rounds(model, opt.rounds, notes)
 
-    tplan = plan_thresholds(model, opt.input)
     if opt.min_code_bytes not in (1, 2):
         raise XgbEdgeError("min_code_bytes must be 1 or 2")
-    tplan.code_bytes = max(tplan.code_bytes, opt.min_code_bytes)
+    if opt.thresholds not in ("auto", "rank", "direct"):
+        raise XgbEdgeError(f"thresholds must be auto, rank or direct, got {opt.thresholds!r}")
+    if opt.input not in INPUT_KINDS:
+        raise XgbEdgeError(f"unknown input kind {opt.input!r}; choose one of {', '.join(INPUT_KINDS)}")
 
     Xv = None
     if validation is not None:
@@ -184,8 +187,18 @@ def export_model(model: Union[Model, str, os.PathLike], options: Optional[Export
         if Xv is not None and Xv.shape[0] > 0:
             evaluation = evaluate(model, [lplan], Xv)[0]
 
-    packed = pack(model, tplan, lplan, leaf_store=opt.leaf_store, min_hdr_bytes=opt.min_hdr_bytes,
+    # Threshold encoding: build the candidates and keep the smaller model.
+    best = None
+    for mode in (("rank", "direct") if opt.thresholds == "auto" else (opt.thresholds,)):
+        tp = plan_thresholds(model, opt.input, mode)
+        if mode == "rank":
+            tp.code_bytes = max(tp.code_bytes, opt.min_code_bytes)
+        pk = pack(model, tp, lplan, leaf_store=opt.leaf_store, min_hdr_bytes=opt.min_hdr_bytes,
                   min_off_bytes=opt.min_off_bytes, min_leaf_bytes=opt.min_leaf_bytes)
+        size = generate(model, tp, lplan, pk, opt.name, sizes_only=True).data_bytes
+        if best is None or size <= best[0]:   # on a tie prefer direct: no table search at run time
+            best = (size, tp, pk)
+    _, tplan, packed = best
     summary = [
         f"{len(model.trees)} trees, {model.n_internal} splits, {model.n_leaves} leaves, "
         f"{model.n_features} features ({len(tplan.used_features)} used), {model.n_classes} classes.",
@@ -204,11 +217,11 @@ def build_report(exp: Export, notes: List[str]) -> Dict:
     n_split = pk.flat.n_nodes
     n_leaf_refs = int(pk.flat.leaf_refs.size)
     cmp_quant = 0
-    if n_split:
+    if n_split and tp.mode == "direct":
+        cmp_quant = len(tp.used_features) if tp.input_kind.is_float else 0   # one NaN test per float feature
+    elif n_split and tp.n_cuts:
         for cuts in tp.cuts:
             cmp_quant += _bit_length(cuts.size) + (1 if tp.input_kind.is_float else 0)
-        if tp.n_cuts == 0:
-            cmp_quant = 0
     cmp_tree = int(sum(model.trees[t].depth for t in stored))
     if n_split == 0:
         cmp_arg = 0
@@ -233,6 +246,7 @@ def build_report(exp: Export, notes: List[str]) -> Dict:
         "xgboost_nodes": model.n_internal + model.n_leaves,
         "max_depth": max((t.depth for t in model.trees), default=0),
         "layout": {
+            "threshold_encoding": tp.mode,
             "header_bytes": pk.hdr_bytes,
             "threshold_code_bytes": pk.code_bytes,
             "offset_bytes": pk.off_bytes,
