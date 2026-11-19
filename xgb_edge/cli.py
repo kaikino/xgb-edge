@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 
 import numpy as np
 
@@ -21,13 +22,24 @@ _MISSING_CELLS = {"", "nan", "na", "n/a", "null", "none", "?"}
 def _load_csv(path: str) -> np.ndarray:
     """Read a CSV of numbers strictly: an empty or NaN cell is missing, anything else must be a number.
 
-    A first line whose cells are not numbers is taken as a header and skipped;
-    text anywhere else is an error rather than a silently missing value.
+    A first line whose cells are not numbers is taken as a header and skipped,
+    and so is a first line that reads exactly 0,1,2,... (the header pandas
+    writes for unnamed columns); text anywhere else is an error rather than a
+    silently missing value.
     """
     import csv
     rows = []
     with open(path, newline="") as f:
-        for lineno, cells in enumerate(csv.reader(f), start=1):
+        reader = csv.reader(f)
+        lineno = 0
+        while True:
+            try:
+                cells = next(reader)
+            except StopIteration:
+                break
+            except csv.Error as e:
+                raise XgbEdgeError(f"{path}, line {lineno + 1}: not readable as CSV ({e})") from None
+            lineno += 1
             if len(cells) == 0 or (len(cells) == 1 and cells[0].strip() == ""):
                 continue                                  # blank line
             vals, bad = [], None
@@ -48,6 +60,9 @@ def _load_csv(path: str) -> np.ndarray:
             rows.append(vals)
     if not rows:
         return np.zeros((0, 0), dtype=np.float64)
+    # pandas' to_csv writes the default column labels 0,1,2,... as a header line
+    if len(rows) > 1 and len(rows[0]) > 1 and rows[0] == [float(i) for i in range(len(rows[0]))]:
+        rows = rows[1:]
     width = len(rows[0])
     for i, r in enumerate(rows):
         if len(r) != width:
@@ -65,12 +80,14 @@ def load_matrix(path: str) -> np.ndarray:
             data = np.load(path, allow_pickle=False)
         elif ext == ".npz":
             with np.load(path, allow_pickle=False) as z:
+                if not z.files:
+                    raise XgbEdgeError(f"{path} holds no arrays")
                 data = z[z.files[0]]
         else:
             data = _load_csv(path)
     except XgbEdgeError:
         raise
-    except (OSError, ValueError, IndexError, EOFError) as e:
+    except (OSError, ValueError, IndexError, EOFError, zipfile.BadZipFile) as e:
         raise XgbEdgeError(f"cannot read {path}: {e}") from None
     if not (np.issubdtype(data.dtype, np.floating) or np.issubdtype(data.dtype, np.integer)
             or data.dtype == np.bool_):
@@ -110,8 +127,10 @@ def _parser() -> argparse.ArgumentParser:
                        help="target whose compiler measures code size and stack for the report, if that "
                             "compiler is installed (default: cortex-m4)")
         s.add_argument("--cc", help="measure with this cross compiler instead of the --target one")
-        s.add_argument("--cflags", help="flags for the measuring compiler (default: the --target flags, "
-                                        f"e.g. {DEFAULT_CFLAGS})")
+        s.add_argument("--cflags", metavar="FLAGS",
+                       help="flags for the measuring compiler, written as --cflags=\"-mcpu=cortex-m0 -Os\" "
+                            "(with the equals sign, because the value starts with a dash); default: the "
+                            "--target flags")
         s.add_argument("--no-measure", action="store_true", help="do not run a compiler; estimate code size")
         s.add_argument("--report-json", metavar="FILE", help="also write the report as JSON")
     return p
@@ -133,6 +152,8 @@ def main(argv=None) -> int:
             parent = os.path.dirname(os.path.abspath(args.report_json))
             if not os.path.isdir(parent):
                 raise XgbEdgeError(f"--report-json: the directory {parent} does not exist")
+            if os.path.isdir(args.report_json):
+                raise XgbEdgeError(f"--report-json {args.report_json} is a directory, not a file name")
         out_dir = getattr(args, "out", None)
         if out_dir is not None and os.path.exists(out_dir) and not os.path.isdir(out_dir):
             raise XgbEdgeError(f"--out {out_dir} exists and is not a directory")

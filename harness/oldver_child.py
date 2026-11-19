@@ -90,6 +90,13 @@ for name, (k, params, rounds, missing) in CASES.items():
     record(name, path, Xall, params["objective"])
 
 
+def count_splits(path):
+    """Number of split nodes in a saved model."""
+    gb = json.load(open(path))["learner"]["gradient_booster"]
+    model = gb["gbtree"]["model"] if "gbtree" in gb else gb["model"]
+    return sum(l != -1 for t in model["trees"] for l in t["left_children"])
+
+
 def hand_built_dart():
     """A DART model on which the in-place path of old releases rounds visibly differently.
 
@@ -141,10 +148,15 @@ def extreme_base_score():
         X, y = make_classification(n_samples=1500, n_features=8, n_informative=5, n_redundant=0, flip_y=0.3,
                                    random_state=7)
         X = X.astype(F32)
-        bst = xgb.train(dict(objective="binary:logistic", max_depth=3, base_score=p, verbosity=0, nthread=2,
-                             seed=0), xgb.DMatrix(X[:1000], label=y[:1000]), num_boost_round=40)
         path = os.path.join(out, "binary_base_score_" + tag + ".json")
+        # With such a base score the hessians are tiny: the default regularisation would refuse every
+        # split.  These settings give trees with real splits and predictions of both classes.
+        bst = xgb.train(dict(objective="binary:logistic", max_depth=3, base_score=p, verbosity=0, nthread=2,
+                             seed=0, min_child_weight=0, reg_lambda=0, max_delta_step=2, tree_method="exact"),
+                        xgb.DMatrix(X[:1000], label=y[:1000]), num_boost_round=40)
         bst.save_model(path)
+        splits = count_splits(path)
+        assert splits > 50, "the extreme-base-score model should have real splits, has %d" % splits
         record("binary_base_score_" + tag, path, X[1000:], "binary:logistic")
 
 

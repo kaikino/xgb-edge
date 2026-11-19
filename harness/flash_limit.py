@@ -36,15 +36,32 @@ def main(argv=None) -> int:
     ap.add_argument("--board", default="A")
     args = ap.parse_args(argv)
     serial = D.board_serial(args.board)
+    results = []
     for size in args.sizes:
         sketch, build, bid = build_padded(size)
         try:
             with D.locked("board_" + serial):
                 link, _ = D.flash_and_open(serial, sketch, build, bid, force=True)
                 link.close()
+            accepted = True
             print(f"{build['program_bytes']} bytes: accepted, board runs it", flush=True)
         except D.DeviceError as e:
+            accepted = False
             print(f"{build['program_bytes']} bytes: REJECTED ({str(e).splitlines()[0][:120]})", flush=True)
+        results.append({"program_bytes": build["program_bytes"], "accepted": accepted})
+    # keep what was measured, so that the limit quoted in the README has an artifact behind it
+    import json
+    import os
+    path = os.path.join(D.DEVDIR, "results", "flash_limit.json")
+    old = []
+    if os.path.exists(path):
+        old = [r for r in json.load(open(path))["probes"]
+               if r["program_bytes"] not in {x["program_bytes"] for x in results}]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    probes = sorted(old + results, key=lambda r: r["program_bytes"])
+    with open(path, "w") as f:
+        json.dump({"board": serial, "limit_used_by_the_harness": D.FLASH_MAX,
+                   "core_advertised_maximum": D.FLASH_MAX_CORE, "probes": probes}, f, indent=1)
     return 0
 
 

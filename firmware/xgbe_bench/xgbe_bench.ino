@@ -117,8 +117,12 @@ static void do_info(uint8_t seq) {
   memcpy(p + 10, &nm, 2);
   put32(p + 12, (uint32_t)MUT_BUILD_ID);
   memcpy(p + 16, &mp, 2);
-  // cost of an empty measurement, so the host can subtract it
-  uint32_t c0 = DWT->CYCCNT, t0 = timer_ticks(), t1 = timer_ticks(), c1 = DWT->CYCCNT;
+  // cost of an empty measurement, taken in exactly the order do_predict() uses, so the
+  // host can subtract it from both clocks
+  uint32_t t0 = timer_ticks();
+  uint32_t c0 = DWT->CYCCNT;
+  uint32_t c1 = DWT->CYCCNT;
+  uint32_t t1 = timer_ticks();
   put32(p + 18, t1 - t0);
   put32(p + 22, c1 - c0);
   send_frame('i', seq, tx, 26);

@@ -247,8 +247,9 @@ def plan_thresholds(model: Model, input_kind: str = "f32", mode: str = "rank") -
     else:
         worst = max(feature_ids, key=lambda f: cuts_by_feature[f].size)
         raise UnsupportedModelError(
-            f"feature {model.feature_label(worst)} has {cuts_by_feature[worst].size} distinct split "
-            "thresholds; at most 65535 per feature are supported.")
+            f"feature {model.feature_label(worst)} needs {max_code} threshold codes "
+            f"({cuts_by_feature[worst].size} distinct thresholds); the rank encoding has room for 65535 per "
+            "feature. Use the direct encoding instead (thresholds='direct' or 'auto').")
 
     # Slots.  Float inputs can be missing (NaN), so a feature needs a slot per
     # default direction that the model actually uses on it.
@@ -378,11 +379,11 @@ def plan_leaves(model: Model, bits: int = 16) -> LeafPlan:
         while s >= 0 and np.rint(max_abs_leaf * math.ldexp(1.0, s)) > limit:
             s -= 1
         if s < 0:
-            need = int(np.rint(max_abs_leaf)).bit_length() + 1
+            need = int(np.rint(max_abs_leaf)).bit_length() + 1   # sign bit + integer part
             raise UnsupportedModelError(
                 f"leaf values reach {max_abs_leaf:g}, which does not fit a {bits}-bit fixed-point "
-                f"leaf even with no fractional bits; use --leaf-bits {min(32, max(need, bits + 8))} "
-                "or more." if need <= 32 else
+                f"leaf even with no fractional bits; at least {need} bits are needed for the integer "
+                "part alone." if need <= 32 else
                 f"leaf values reach {max_abs_leaf:g}, too large for 32-bit fixed point.")
     else:
         s = 16  # no stored leaves (or all zero): only the bias needs a scale

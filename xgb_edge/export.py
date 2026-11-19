@@ -84,8 +84,10 @@ def to_device_inputs(X, n_features: int, input_kind: str) -> np.ndarray:
         # compare as Python numbers: float32(2**31 - 1) is 2**31, which would hide an overflow
         lo_v, hi_v = X.min().item(), X.max().item()
         if lo_v < kind.lo or hi_v > kind.hi:
+            def show(v):
+                return str(int(v)) if float(v).is_integer() else repr(float(v))
             raise XgbEdgeError(
-                f"the data has values in [{lo_v:g}, {hi_v:g}], outside the range of {kind.ctype} "
+                f"the data has values in [{show(lo_v)}, {show(hi_v)}], outside the range of {kind.ctype} "
                 f"[{kind.lo}, {kind.hi}]")
     dtype = {"i8": np.int8, "u8": np.uint8, "i16": np.int16, "u16": np.uint16, "i32": np.int32}[kind.name]
     return np.ascontiguousarray(X.astype(dtype))
@@ -116,6 +118,9 @@ def select_rounds(model: Model, rounds: Union[str, int], notes: List[str]) -> Mo
     xgboost" is ambiguous and the caller has to say which one is meant.
     """
     best, total = model.best_iteration, model.n_rounds
+    if best is not None and not 0 <= best < total:
+        raise XgbEdgeError(f"the model's best_iteration attribute is {best}, but it has {total} boosting "
+                           "rounds (valid values are 0 to " + str(total - 1) + "); the file is inconsistent")
     if rounds == "auto":
         if best is not None and best + 1 < total:
             raise XgbEdgeError(
@@ -133,8 +138,6 @@ def select_rounds(model: Model, rounds: Union[str, int], notes: List[str]) -> Mo
         if best is None:
             raise XgbEdgeError("--rounds best: the model has no best_iteration attribute "
                                "(it was not trained with early stopping)")
-        if not 0 <= best < total:
-            raise XgbEdgeError(f"best_iteration {best} is out of range for a model with {total} rounds")
         if best + 1 < total:
             notes.append(f"exporting the first {best + 1} of {total} rounds (best_iteration {best}), "
                          "as XGBClassifier.predict() does")
@@ -179,13 +182,14 @@ def export_model(model: Union[Model, str, os.PathLike], options: Optional[Export
     evaluation = None
     if opt.leaf_bits == "auto":
         plans = []
+        last_error = None
         for b in AUTO_LEAF_BITS:
             try:
                 plans.append(plan_leaves(model, b))
-            except UnsupportedModelError:
-                continue
+            except UnsupportedModelError as e:
+                last_error = e
         if not plans:
-            raise UnsupportedModelError("no fixed-point leaf width up to 32 bits can hold this model's leaves")
+            raise last_error   # the reason the widest width fails is the one worth reporting
         if Xv is not None and Xv.shape[0] > 0:
             evals = evaluate(model, plans, Xv)
             widest = evals[-1]

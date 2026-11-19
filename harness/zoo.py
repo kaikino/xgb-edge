@@ -21,14 +21,28 @@ ZOO_DIR = os.path.join(ROOT, "build", "zoo")
 CACHE_VERSION = 4
 
 
-def code_stamp() -> str:
-    """Hash of the exporter's source, stored with every result so stale results can be recognised."""
+#: files beyond the exporter itself that a kind of result depends on
+STAMP_EXTRA = {
+    "device": ["firmware/xgbe_bench/xgbe_bench.ino", "harness/device.py", "bench/float_baseline.py"],
+    "sizes": ["bench/sizes.py", "bench/altgen.py", "bench/float_baseline.py"],
+    "packages": ["harness/build_packages.py"],
+    "oldver": ["harness/oldver_child.py"],
+}
+
+
+def code_stamp(kind: str = "") -> str:
+    """Hash of the source a result depends on, stored with it so stale results can be recognised.
+
+    Always covers the exporter (xgb_edge/*.py); ``kind`` adds the harness or firmware files
+    that produce that kind of result.
+    """
     h = hashlib.sha1()
     pkg = os.path.join(ROOT, "xgb_edge")
-    for fn in sorted(os.listdir(pkg)):
-        if fn.endswith(".py"):
-            with open(os.path.join(pkg, fn), "rb") as f:
-                h.update(fn.encode() + b"\0" + f.read())
+    files = [os.path.join(pkg, fn) for fn in sorted(os.listdir(pkg)) if fn.endswith(".py")]
+    files += [os.path.join(ROOT, rel) for rel in STAMP_EXTRA.get(kind, [])]
+    for path in files:
+        with open(path, "rb") as f:
+            h.update(os.path.basename(path).encode() + b"\0" + f.read())
     return h.hexdigest()[:12]
 
 
@@ -192,8 +206,9 @@ def inplace_reference(model_path: str, objective: str, X: np.ndarray):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         bst = xgb.Booster(model_file=model_path)
-        margin = np.asarray(bst.inplace_predict(X, predict_type="margin"), dtype=np.float32).reshape(X.shape[0], -1)
-        p = np.asarray(bst.inplace_predict(X))
+        margin = np.asarray(bst.inplace_predict(X, predict_type="margin", validate_features=False),
+                            dtype=np.float32).reshape(X.shape[0], -1)
+        p = np.asarray(bst.inplace_predict(X, validate_features=False))
     if objective == "multi:softprob":
         cls = np.argmax(p, axis=1).astype(np.int64)
     elif objective == "multi:softmax":

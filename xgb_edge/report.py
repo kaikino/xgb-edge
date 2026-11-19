@@ -68,7 +68,11 @@ def measure(header: str, source: str, name: str, cc: str, cflags: str = DEFAULT_
         with open(src, "w") as f:
             f.write(source)
         obj = os.path.join(d, name + ".o")
-        cmd = [cc] + shlex.split(cflags) + ["-std=c99", "-Wall", "-Wextra", "-Werror", "-fstack-usage",
+        try:
+            flags = shlex.split(cflags)
+        except ValueError as e:
+            raise RuntimeError(f"cannot parse the compiler flags {cflags!r}: {e}") from None
+        cmd = [cc] + flags + ["-std=c99", "-Wall", "-Wextra", "-Werror", "-fstack-usage",
                                            "-ffunction-sections", "-fdata-sections", "-c", src, "-o", obj]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True)

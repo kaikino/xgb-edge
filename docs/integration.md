@@ -277,7 +277,7 @@ as expected, a Kconfig error when the module is not registered at all); and
 a separate ESP-IDF project with the component in `components/` and
 `PRIV_REQUIRES`.
 
-Run on hardware: `python -m harness.device example --board B` exports the
+Run on hardware: `python -m harness.device example --board A` exports the
 Arduino package for the same model, builds its example with `-Os`, uploads it
 to a Seeed XIAO nRF52840 Sense Plus and reads the serial port. The board
 printed
@@ -287,8 +287,10 @@ demo_model: class 1, margins [-110264, 33593, -44637, -12703, -4387] / 2^15, sel
 ```
 
 which is the class and the margins xgb-edge computed at export time. The
-Zephyr and ESP-IDF examples and the ESP32 Arduino builds were **not** run on
-hardware.
+Zephyr and ESP-IDF examples and the ESP32 Arduino builds were **not** verified
+on hardware. (The Zephyr sample was flashed to a XIAO once; it booted and
+enumerated on USB, but macOS created no serial port for it, so its output
+could not be read.)
 
 Not done: no ESP32 or Zephyr image was flashed; nothing was built with nRF Connect SDK, with
 the Arduino IDE (only arduino-cli), for AVR boards, or with an ESP-IDF

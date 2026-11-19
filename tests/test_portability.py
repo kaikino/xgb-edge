@@ -98,3 +98,76 @@ def test_generated_c_is_also_valid_cxx(tmp_path):
         r = subprocess.run(["c++", "-x", "c++", "-std=c++11", "-Wall", "-Wextra", "-Werror", "-c",
                             str(d / "m.c"), "-o", str(d / "m.o")], capture_output=True, text=True)
         assert r.returncode == 0 and not r.stderr.strip(), r.stderr
+
+
+# --------------------------------------------------------------------------- "integer only" is a checked claim
+
+def _tool(cc: str, name: str) -> str:
+    import re
+    return re.sub(r"gcc$", name, cc)
+
+
+#: names of compiler support routines for float arithmetic, comparison and conversion, and of libm
+import re as _re
+_FLOAT_HELPER = _re.compile(r"^__aeabi_[fd]|^__aeabi_[a-z]+2[fd]$|[sdt]f\d*$|^__(fix|float|extend|trunc)|"
+                            r"^(exp|log|pow|sqrt|fabs|fmax|fmin|ldexp|frexp)f?$")
+
+
+def _undefined_symbols(cc: str, obj: str):
+    r = subprocess.run([_tool(cc, "nm"), "-u", obj], capture_output=True, text=True, check=True)
+    return {line.split()[-1] for line in r.stdout.splitlines() if line.strip()}
+
+
+def test_generated_code_needs_no_floating_point_support(tmp_path):
+    """Compiled for CPUs without an FPU, the model must not pull in a single soft-float routine.
+
+    On such targets every float operation becomes a call into the compiler's
+    support library (__aeabi_fadd, __ltsf2, ...), so the object's undefined
+    symbols show whether the code computes with floats.  The only external
+    symbol allowed is memcpy, which float-input models use to read the bits of a
+    float (compilers usually inline it).
+    """
+    targets = available_targets()
+    soft = {}
+    if "cortex-m4" in targets:
+        soft["cortex-m0"] = (targets["cortex-m4"][0], "-mcpu=cortex-m0 -mthumb -Os")
+        soft["cortex-m0 -O3"] = (targets["cortex-m4"][0], "-mcpu=cortex-m0 -mthumb -O3")
+    if "esp32c3" in targets:
+        soft["rv32imc"] = targets["esp32c3"]            # ESP32-C3 has no FPU
+    if "avr" in targets:
+        soft["avr"] = targets["avr"]
+    if not soft:
+        pytest.skip("no cross compiler for an FPU-less target installed")
+    path = _model(tmp_path, 4)
+    for i, opts in enumerate(VARIANTS):
+        d = tmp_path / f"v{i}"
+        export_model(path, ExportOptions(name="m", **opts)).write(str(d))
+        for target, (cc, flags) in soft.items():
+            obj = str(d / f"m_{target.replace(' ', '_')}.o")
+            r = subprocess.run([cc] + flags.split() + ["-std=c99", "-c", str(d / "m.c"), "-o", obj],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stderr
+            undefined = _undefined_symbols(cc, obj)
+            floaty = [u for u in undefined if _FLOAT_HELPER.search(u)]
+            assert not floaty, (target, opts, floaty)
+            # and nothing else either, apart from memcpy and (AVR) the start-up code that copies tables to RAM
+            assert undefined <= {"memcpy", "__do_copy_data", "__do_clear_bss"}, (target, opts, sorted(undefined))
+
+
+def test_no_fpu_instructions_even_where_an_fpu_exists(tmp_path):
+    """Cortex-M4F with hard-float ABI at -O3: the predict function must contain no FPU instruction."""
+    import re
+    targets = available_targets()
+    if "cortex-m4" not in targets:
+        pytest.skip("arm-none-eabi-gcc not installed")
+    cc = targets["cortex-m4"][0]
+    path = _model(tmp_path, 4)
+    for i, opts in enumerate(VARIANTS):
+        d = tmp_path / f"v{i}"
+        export_model(path, ExportOptions(name="m", **opts)).write(str(d))
+        obj = str(d / "m.o")
+        subprocess.run([cc, "-mcpu=cortex-m4", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv4-sp-d16", "-O3", "-std=c99",
+                        "-c", str(d / "m.c"), "-o", obj], check=True, capture_output=True)
+        asm = subprocess.run([_tool(cc, "objdump"), "-d", obj], capture_output=True, text=True, check=True).stdout
+        fpu = sorted(set(re.findall(r"\t(v[a-z0-9.]+)\s", asm)))
+        assert not fpu, (opts, fpu)

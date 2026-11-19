@@ -90,11 +90,11 @@ an example program, add `--package arduino|zephyr|esp-idf`; see
 
 | option | meaning |
 |---|---|
-| `--validation FILE` | `.npy`, `.npz` or `.csv` feature matrix (NaN or empty cell = missing; a CSV header line is skipped, any other text is an error). Used to choose the leaf width and to report rows close to a tie. Recommended. |
+| `--validation FILE` | `.npy`, `.npz` or `.csv` feature matrix (NaN or empty cell = missing). A CSV header line is skipped: either text, or the `0,1,2,...` that pandas writes for unnamed columns; any other text is an error. Used to choose the leaf width and to report rows close to a tie. Recommended. |
 | `--leaf-bits auto\|N` | Width of the fixed-point leaf values. `auto` (default) picks the narrowest of 8, 16, 24, 32 bits at which leaf rounding puts no validation row at risk (beyond rows that XGBoost's own float32 rounding already puts at risk); without validation data it uses 16. |
 | `--input f32\|i8\|u8\|i16\|u16\|i32` | Type of the feature array. With an integer type the model is evaluated on raw integer features (for example sensor counts) with integer thresholds and no float anywhere. The model must have been trained on those same integer values, and integer inputs cannot be missing. |
 | `--rounds all\|best\|N` | Required for a model trained with early stopping, where `XGBClassifier.predict` uses fewer trees than `Booster.predict`; see [Early stopping](#early-stopping). |
-| `--target cortex-m4\|esp32\|esp32c3\|avr` | Which installed cross compiler measures code size and stack for the report (default `cortex-m4`). |
+| `--target cortex-m4\|esp32\|esp32c3\|avr` | Which installed cross compiler measures code size and stack for the report (default `cortex-m4`). Other compilers: `--cc PATH --cflags="..."` (with the equals sign). |
 | `--package arduino\|zephyr\|esp-idf` | Write a platform package instead of bare files. |
 
 `xgb-edge report model.json ...` prints the same report without writing C.
@@ -185,6 +185,9 @@ needs it. Trees are stored grouped by class, so the interpreter needs no
 per-tree class number: it walks the trees of class 0, then class 1, and so
 on, and keeps the running best. The whole run-time is one function of about
 300 bytes; prediction is the arg max of the integer margins, with no softmax.
+The only library call it can make is `memcpy`, which float-input models use
+to read a float's bits; compilers normally inline it (the RISC-V ESP32-C3
+build at `-Os` is one that calls the C library instead).
 
 How many bytes a split costs depends on the field widths the model needs.
 The 5-class example below uses 4.59 bytes per split node (its leaves
@@ -247,18 +250,20 @@ two were equal on every model).
 
 ### On a real nRF52840, against a float32 baseline
 
-Hardware: two Seeed XIAO nRF52840 Sense Plus boards (Cortex-M4F, 64 MHz),
-Arduino core `Seeeduino:nrf52` 1.1.13, `arm-none-eabi-gcc` 9.2.1, `-Os`.
-The test firmware receives every test row over USB serial, runs the model
-and returns class, margins and the inference time measured on the board with
-a 16 MHz hardware timer (best of 3 runs per row, mean over rows shown).
-xgb-edge ran on one board and the float baseline on the other; swapping the
-boards for one model changed the times by less than 0.2%.
+Hardware: a Seeed XIAO nRF52840 Sense Plus (Cortex-M4F, 64 MHz), Arduino core
+`Seeeduino:nrf52` 1.1.13, `arm-none-eabi-gcc` 9.2.1, `-Os`. The test firmware
+receives every test row over USB serial, runs the model and returns class,
+margins and the inference time measured on the board with a 16 MHz hardware
+timer (best of 3 runs per row, mean over rows shown). For each model the
+xgb-edge firmware and the float-baseline firmware are flashed to the same
+board one after the other and are sent the same rows. (During development
+the two builds ran side by side on two boards of this type, and swapping the
+boards changed the times by less than 0.2%; that cross-check is not part of
+the results below.)
 
 The float baseline (`bench/float_baseline.py`) is what a careful engineer
 might write without this tool: the same table-walk idea with float32
-thresholds and leaves, 8 bytes per node, using the board's FPU. On the board
-its margins were bit-identical to XGBoost's.
+thresholds and leaves, 8 bytes per node, using the board's FPU.
 
 <!-- table:device -->
 | model | rows sent to the board | differ from xgboost | leaf bits | flash reported by the tool (B) | flash in the linked image (B) | float baseline flash (B) | float / xgb-edge | xgb-edge time (us) | float baseline time (us) | float / xgb-edge time | worst-case comparisons | stack reported / measured (B) | result |
@@ -274,19 +279,31 @@ its margins were bit-identical to XGBoost's.
 | `mc4_int16` | 2,145 | 0 | 16 | 41,293 | 41,293 | 130,416 | 3.2x | 578 | 866 | 1.50x | 1,539 | 64 / 64 | pass |
 <!-- /table:device -->
 
-* "rows sent to the board" are all test rows of the model: the held-out split
+* "rows sent to the board" are the test rows of the model: the held-out split
   plus rows placed exactly on, just below and just above split thresholds,
   rows with missing values and rows with extreme magnitudes.
 * "does not fit": the firmware would exceed what the board's bootloader
-  accepts (see [Limitations](#limitations)).
-* `mc16_d5_r397_hist` is sized to fill the board: its firmware is 796,772
-  bytes of the 798,720 the bootloader accepts.
+  accepts (see below).
+* `mc16_d5_r397_hist` is sized to fill the board; its whole firmware is just
+  under the bootloader's limit.
 * There is no power measurement equipment here, so no energy figures are
   given. Inference time and the worst-case comparison count are what was
   measured.
 
-With `-O2` or the core's default `-Ofast` the 5-class model takes 406 us
-(xgb-edge) and 552 us (float baseline) instead of 454 us and 639 us.
+The same 5-class model at other optimisation levels (the Arduino core's
+default is `-Ofast`); each line is a separate build, flashed and run:
+
+<!-- table:optlevels -->
+(run python -m harness.results --update-readme)
+<!-- /table:optlevels -->
+
+The board's bootloader accepts less than the 811,008 bytes the Arduino core
+reports as the maximum program size. `python -m harness.flash_limit` builds
+firmware of an exact size and tries to upload it:
+
+<!-- table:flashlimit -->
+(run python -m harness.results --update-readme)
+<!-- /table:flashlimit -->
 
 ### Flash size against m2cgen and TL2cgen
 
@@ -444,13 +461,17 @@ Each model is compared with that release's `Booster.predict` and with its `inpla
 Nothing is silently approximated: if the exporter cannot reproduce a model
 exactly up to the stated leaf rounding, it stops with an error that says why.
 
-"XGBoost's class" means what `Booster.predict` on a `DMatrix` and
-`XGBClassifier.predict` / `Booster.inplace_predict` return (argmax of the
-probabilities, or probability above 0.5 for a binary model). The test
-harness checks both paths; they can differ in the last bits of the margins,
-most visibly for DART models on XGBoost 3.0 and earlier, and the reported
-noise bound covers both. Model files written by XGBoost 1.6, 1.7, 2.0, 2.1,
-3.0 and 3.4 are tested.
+"XGBoost's class" means the argmax of the probabilities (probability above
+0.5 for a binary model) that `Booster.predict` on a `DMatrix` and
+`Booster.inplace_predict` return; `XGBClassifier.predict` is the latter. The
+test harness checks both paths; they can differ in the last bits of the
+margins, most visibly for DART models on XGBoost 3.0 and earlier, and the
+reported noise bound covers both. Two wrapper quirks are not the model's
+doing: for a two-class model trained with `multi:softprob`,
+`XGBClassifier.predict` returns a one-hot matrix rather than class numbers,
+and in XGBoost 1.x it answers only 0 or 1 for a natively trained
+`multi:softmax` model. Model files written by XGBoost 1.6, 1.7, 2.0, 2.1,
+3.0, 3.1, 3.2 and 3.4 are tested.
 
 ### Early stopping
 
@@ -475,9 +496,9 @@ computes).
   statement about those rows. Unseen inputs can still be near-ties; use
   `SAFE_GAP` if that matters.
 * **Float inputs must be float32 and missing must be NaN.** If you trained
-  with another `missing=` value, map it to NaN before calling. XGBoost itself
-  refuses infinite inputs; the generated C treats them as larger or smaller
-  than every finite value.
+  with another `missing=` value, map it to NaN before calling. Infinite
+  inputs are treated as larger or smaller than every finite value, which is
+  what `inplace_predict` does too (a `DMatrix` refuses them).
 * **The reference is the XGBoost release that saved the model file.** Where
   releases differ (how a `binary:logistic` base score outside
   [1e-6, 1 - 1e-6] becomes a margin changed in 3.2), the export follows the
@@ -488,14 +509,13 @@ computes).
 * **Per-row `base_margin` is not supported**, nor is predicting with a subset
   of trees at run time.
 * **Flash is the limit.** The largest model that fit the XIAO nRF52840 here
-  has 6,352 trees and 266,000 XGBoost nodes. Note that the board's bootloader
-  accepts at most 798,720 bytes over DFU, less than the 811,008 bytes the
-  Arduino core reports as the maximum (measured with
-  `python -m harness.flash_limit`).
-* **Speed.** On the nRF52840, which has an FPU, inference was between the
-  same speed as the float baseline (a toy model) and 1.5 times faster, not
-  dramatically faster; the gain is mostly flash. Small models with many
-  features spend a visible share of the time ranking features.
+  has 6,352 trees and 266,000 XGBoost nodes, and the board's bootloader
+  accepts less than the Arduino core advertises (see the results).
+* **Speed.** On the nRF52840, which has an FPU, inference is moderately
+  faster than the float baseline, not dramatically (the measured ratios are
+  under the device table; a toy model shows no difference). The gain is
+  mostly flash. Small models with many features spend a visible share of the
+  time ranking features.
 * **AVR.** The generated C compiles for 8-bit AVR, but there `const` tables
   are copied to RAM (the report for `--target avr` counts them as RAM), so
   only very small models are usable. AVR was not a target of this work and
@@ -513,11 +533,17 @@ computes).
 | integer margins equal the tool's exact simulation, bit for bit | yes | yes | not run |
 | split decisions equal xgboost's at and around thresholds | yes: property tests against xgboost itself | boundary rows are part of what is sent to the board | not run |
 | compiles without warnings under `-Wall -Wextra` | yes (clang, also `-Wpedantic -Wconversion`, and as C++) | yes (`arm-none-eabi-gcc -Werror`, and the Arduino build) | compiled only (`-Werror`, Xtensa and RISC-V) |
+| no floating-point operations | objects for FPU-less targets reference no soft-float routine; no FPU instruction on Cortex-M4F | the same code runs there | compiled only |
 | reported flash size equals the built size | the declared tables equal `.rodata` for all three compilers (only tables of at most 8 entries, which a compiler may fold away, are exempt) | reported total equals the model's symbols in the linked image, to the byte | table sizes checked, compiled only |
 | stack use | from `-fstack-usage` | measured on the board; never above the report, equal to it at `-Os` | compiled only |
 | inference time | not measured | measured with a hardware timer | not measured |
 | float baseline, m2cgen, TL2cgen sizes | - | float baseline run on a board; m2cgen and TL2cgen objects only | not built |
-| platform packages | examples run against stub headers | Arduino example run on a board (prints `self-check OK`); Zephyr sample built, not run | Arduino and ESP-IDF examples built, not run |
+| platform packages | examples run against stub headers | Arduino example run on a board (prints `self-check OK`); Zephyr sample built for the XIAO and the nRF52840 DK, not verified on hardware (see below) | Arduino and ESP-IDF examples built, not run |
+
+One attempt was made to run the Zephyr sample on a XIAO board. The image
+booted (the board enumerated on USB as Zephyr's CDC ACM device), but macOS
+never created a serial port for it, so its output could not be read and the
+sample remains unverified on hardware.
 
 ## Tests
 
@@ -534,9 +560,16 @@ make oldver      # models trained by older xgboost releases (needs uv and networ
   are adjacent floats of each other, feed inputs equal to each threshold and
   one float32 below and above it, and require the compiled C to reach the
   same leaf as xgboost itself. The same for integer inputs.
-  `python -m harness.mutation` checks that these tests have teeth: it applies
-  15 deliberately wrong variants of the rounding one at a time (for example
-  `<` instead of `<=` in the rank search) and each one makes the tests fail.
+  `python -m harness.mutation` checks that these tests and the guarantee
+  tests have teeth: it applies 24 deliberately wrong variants one at a time
+  (for example `<` instead of `<=` in the rank search, or a float-noise bound
+  of zero) and each one makes the tests fail.
+* `tests/test_guarantee.py`: one model per ingredient of the guarantee (leaf
+  rounding bound, XGBoost's float32 noise, its softmax/sigmoid ties,
+  `SAFE_GAP`, the header macros) on which that ingredient decides the
+  outcome, and a check that the harness fails when the ingredient is removed
+  or inflated until it is meaningless. `harness/independent.py` recomputes
+  the bounds without the exporter's bound code for every zoo export.
 * `tests/test_model.py`: exact decimal-to-float32 parsing of the JSON
   (including values a hair away from a float32 midpoint) and one test per
   rejected model variant.
@@ -547,14 +580,16 @@ make oldver      # models trained by older xgboost releases (needs uv and networ
 * `harness/parity.py`: the zoo. `harness/oldver.py`: models from older
   XGBoost releases. `harness/device.py`: the same checks on a board.
 
-To repeat the hardware runs (two XIAO nRF52840 boards, serial numbers in
-`harness/device.py`):
+To repeat the hardware runs (XIAO nRF52840 boards are selected by the USB
+serial numbers in `harness/device.py`; `make device device-float optlevels
+example` does the same):
 
 ```sh
 python -m harness.device suite --board A                 # xgb-edge, every row, timing
-python -m harness.device suite --board B --kind float bin_d2_r5_hist mc3_d3_r10_hist \
+python -m harness.device suite --board A --kind float bin_d2_r5_hist mc3_d3_r10_hist \
     mc5_d4_r50_hist_missing bin_d6_r200_exact_missing mc10_digits_d6_r100_hist mc3_dart mc4_int16
-python -m harness.device example --board B               # the packaged Arduino example
+python -m harness.device example --board A               # the packaged Arduino example
+python -m harness.flash_limit --board A 798720 798724    # what the bootloader accepts
 python -m bench.sizes --tl2cgen-parallel-comp 32         # flash sizes of the alternatives
 python -m harness.build_packages                         # Arduino, ESP-IDF and Zephyr builds
 python -m harness.results --update-readme                # rewrite the tables in this README
@@ -568,8 +603,9 @@ xgb_edge/        the exporter: model.py (loading, validation), quantize.py (thre
                  pack.py (node stream), codegen.py (C), analysis.py (error bounds, tie risk),
                  package.py (Arduino / Zephyr / ESP-IDF), cli.py
 firmware/        the on-device test firmware (Arduino sketch)
-harness/         parity.py (host), device.py (boards), zoo.py (test models), synth.py (hand-built
-                 models), oldver.py (older xgboost), build_packages.py, results.py
+harness/         parity.py (host), independent.py (bounds recomputed independently), device.py (boards),
+                 zoo.py (test models), synth.py (hand-built models), oldver.py (older xgboost),
+                 mutation.py, build_packages.py, results.py
 bench/           float baseline, m2cgen and TL2cgen generation, size measurement
 tests/           pytest suite
 docs/            integration guide for the three platforms

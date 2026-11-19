@@ -281,8 +281,39 @@ def test_forests_with_boundary_inputs_pass_the_full_parity_check(data):
     assert res["failures"] == [], res["failures"]
 
 
+def test_infinite_inputs_match_xgboost_inplace_predict():
+    """DMatrix refuses infinite inputs, but Booster.inplace_predict (and so XGBClassifier.predict) accepts
+    them.  The generated C must send them where xgboost does: +inf is not below any threshold, -inf is
+    below every finite one."""
+    import warnings
+
+    import xgboost as xgb
+    rng = np.random.RandomState(5)
+    pools = {0: F32([-FMAX, -1.0, 0.0, 2.5, FMAX]), 1: F32([-3.0, 1e-30, 7.0]), 2: F32([0.5, FMAX])}
+    for n_classes in (2, 3):
+        groups = 1 if n_classes == 2 else n_classes
+        trees = [synth.random_tree(rng, 3, pools, 14, group=g) for g in range(groups)]
+        synth.number_leaves(trees)
+        special = [float("inf"), float("-inf"), float("nan"), FMAX, -FMAX, 0.0, 2.5, 1.0]
+        X = np.array([[a, b, c] for a in special for b in special for c in special], dtype=F32)
+        with tempfile.TemporaryDirectory() as d:
+            path = synth.write_model(os.path.join(d, "m.json"), trees, 3, n_classes)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                bst = xgb.Booster(model_file=path)
+                margin = np.asarray(bst.inplace_predict(X, predict_type="margin")).reshape(X.shape[0], -1)
+            for mode in ("rank", "direct"):
+                exp = export_model(path, ExportOptions(name="m", leaf_bits=32, thresholds=mode))
+                exe = compile_host(exp, os.path.join(d, mode))
+                _, c_margin, _, _ = run_host(exe, X, exp.model.n_groups)
+                # every group has one tree with distinct, exactly representable leaves: equal margins
+                # mean the same leaf was reached
+                got = c_margin * 2.0 ** -exp.lplan.shift
+                assert np.array_equal(got.astype(F32), margin.astype(F32)), (n_classes, mode)
+
+
 def test_infinite_inputs_and_thresholds_follow_float_semantics():
-    """xgboost refuses inf input, so compare with the float32 reference traversal instead."""
+    """Infinite *thresholds* cannot be given to xgboost at all; compare with the float32 reference traversal."""
     from xgb_edge.refsim import leaf_indices
     t = synth.SynthTree()
     t.add_leaf(0)

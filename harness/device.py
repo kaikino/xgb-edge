@@ -3,7 +3,7 @@
     python -m harness.device list
     python -m harness.device run MODEL [--variant N] [--kind xgbe|float] [--board A|B]
     python -m harness.device suite [--board A]
-    python -m harness.device example [--board B]     (the packaged Arduino example)
+    python -m harness.device example [--board A]     (the packaged Arduino example)
 
 For a zoo model it exports C (or generates the float baseline), builds the
 test firmware in firmware/xgbe_bench around it, uploads it to the chosen board
@@ -114,12 +114,14 @@ int mut_predict(const void *features, void *margins);
 
 
 def make_sketch(tag: str, files: Dict[str, str], nf: int, nm: int, feat_bytes: int, margin_float: bool,
-                mut_body: str, pad_bytes: int = 0) -> Tuple[str, int]:
+                mut_body: str, pad_bytes: int = 0, opt: str = "-Os") -> Tuple[str, int]:
     """Copy the firmware sketch to build/device/<tag>/ and add the model under test."""
     d = os.path.join(DEVDIR, tag, "xgbe_bench")
     os.makedirs(d, exist_ok=True)
+    # the id identifies the binary: sources *and* optimisation level, so that a board still running
+    # the same sources built with another flag is not mistaken for up to date
     blob = "".join(files[k] for k in sorted(files)) + mut_body + open(os.path.join(SKETCH, "xgbe_bench.ino")).read() \
-        + str(pad_bytes)
+        + str(pad_bytes) + opt
     build_id = zlib.crc32(blob.encode()) & 0xFFFFFFFF
     wanted = dict(files)
     wanted["xgbe_bench.ino"] = open(os.path.join(SKETCH, "xgbe_bench.ino")).read()
@@ -360,13 +362,17 @@ def run_model(model_name: str, variant: int = 0, kind: str = "xgbe", board: str 
     model = load(tr.model_path)
     opts = spec.exports[variant] if kind == "xgbe" else {}
     options = ExportOptions(name=MODEL_NAME, **opts)
-    sel = rows_for_input(tr.X, options.input if kind == "xgbe" else "f32")
+    # The float baseline gets exactly the rows the xgb-edge export of this model gets (for an
+    # integer-input export: the integer rows), so that the two are compared on the same data.
+    row_input = ExportOptions(**spec.exports[variant]).input
+    sel = rows_for_input(tr.X, row_input)
     if max_rows:
         sel = sel[:max_rows]
     X = tr.X[sel]
     xgb_class, xgb_margin = tr.xgb_class[sel], tr.xgb_margin[sel]
     res: Dict = {"model": model_name, "kind": kind, "variant": variant_label(opts) if kind == "xgbe" else "float32 baseline",
-                 "board": serial, "opt": opt, "rows": int(sel.size), "failures": []}
+                 "board": serial, "opt": opt, "rows": int(sel.size), "rows_total": int(tr.X.shape[0]),
+                 "input": options.input if kind == "xgbe" else "f32", "row_set": row_input, "failures": []}
     fails: List[str] = res["failures"]
     log = (lambda *a: None) if quiet else (lambda *a: print(*a, flush=True))
 
@@ -400,7 +406,7 @@ def run_model(model_name: str, variant: int = 0, kind: str = "xgbe", board: str 
 
     nf, nm = model.n_features, model.n_groups
     tag = f"{model_name}__{kind}{variant if kind == 'xgbe' else ''}"
-    sketch, build_id = make_sketch(tag, files, nf, nm, dev_in.dtype.itemsize, margin_float, body)
+    sketch, build_id = make_sketch(tag, files, nf, nm, dev_in.dtype.itemsize, margin_float, body, opt=opt)
     log(f"[{model_name} {res['variant']} on {board}] compiling ({opt}) ...")
     build = compile_sketch(sketch, opt)
     res["build"] = {k: build[k] for k in ("program_bytes", "max_bytes", "ram_bytes", "compile_seconds", "warnings")}
@@ -438,7 +444,8 @@ def run_model(model_name: str, variant: int = 0, kind: str = "xgbe", board: str 
 
     differ = cls != xgb_class
     res["differ_from_xgboost"] = int(differ.sum())
-    res["code"] = zoo.code_stamp()
+    res["code"] = zoo.code_stamp("device")
+    res["build_id"] = f"{build_id:08X}"
     if kind == "xgbe":
         ev = exp.evaluation
         margins = raw.view(np.int32).astype(np.int64)
@@ -481,7 +488,7 @@ def run_model(model_name: str, variant: int = 0, kind: str = "xgbe", board: str 
     return res
 
 
-def run_packaged_example(board: str = "B", model_name: str = "mc5_d4_r50_hist_missing", opt: str = "-Os") -> Dict:
+def run_packaged_example(board: str = "A", model_name: str = "mc5_d4_r50_hist_missing", opt: str = "-Os") -> Dict:
     """Export the Arduino package, build its example, flash it and read its self-check line from the board."""
     from xgb_edge.package import write_package
     serial = board_serial(board)
@@ -514,7 +521,8 @@ def run_packaged_example(board: str = "B", model_name: str = "mc5_d4_r50_hist_mi
         finally:
             ser.close()
     ok = bool(lines) and all(want in ln and ln.endswith("self-check OK") for ln in lines)
-    res = {"board": serial, "model": model_name, "lines": lines, "expected": want, "ok": ok}
+    res = {"board": serial, "model": model_name, "lines": lines, "expected": want, "ok": ok,
+           "code": zoo.code_stamp("device")}
     os.makedirs(os.path.join(DEVDIR, "results"), exist_ok=True)
     with open(os.path.join(DEVDIR, "results", "arduino_example.json"), "w") as f:
         json.dump(res, f, indent=1)
@@ -526,7 +534,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
     e = sub.add_parser("example", help="run the packaged Arduino example on a board and check its self-check line")
-    e.add_argument("--board", default="B")
+    e.add_argument("--board", default="A")
     r = sub.add_parser("run")
     r.add_argument("model")
     r.add_argument("--variant", type=int, default=0)

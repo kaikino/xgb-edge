@@ -578,4 +578,6 @@ def load(path) -> Model:
         raise ModelFormatError(f"{path} is not valid JSON: {e}") from None
     except RecursionError:
         raise ModelFormatError(f"{path} is not valid JSON: nested too deeply") from None
+    except ValueError as e:   # e.g. an integer literal with thousands of digits
+        raise ModelFormatError(f"{path} is not a usable JSON model: {e}") from None
     return from_json(doc, hook)

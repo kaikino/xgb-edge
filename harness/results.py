@@ -36,11 +36,13 @@ def _stamp() -> str:
     return zoo.code_stamp()
 
 
-def _check_fresh(rows: List[Dict], what: str) -> None:
-    stale = sorted({str(r.get("code")) for r in rows if r.get("code") != _stamp()})
+def _check_fresh(rows: List[Dict], what: str, kind: str = "") -> None:
+    from harness import zoo
+    now = zoo.code_stamp(kind)
+    stale = sorted({str(r.get("code")) for r in rows if r.get("code") != now})
     if stale:
-        PROBLEMS.append(f"{what}: results were produced by other exporter code (stamp {', '.join(stale)}, "
-                        f"current {_stamp()}); re-run it")
+        PROBLEMS.append(f"{what}: results were produced by other code (stamp {', '.join(stale)}, "
+                        f"current {now}); re-run it")
 
 
 def _load(rel: str):
@@ -113,15 +115,17 @@ def device() -> str:
     missing = [s.name for s in zoo.SPECS if s.board and not res.get(s.name, {}).get("xgbe")]
     if missing:
         PROBLEMS.append(f"device: no on-board result for {', '.join(missing)}; run python -m harness.device suite")
-    _check_fresh([r for m in res.values() for r in m.values()], "device")
+    _check_fresh([r for m in res.values() for r in m.values()], "device", "device")
     rows = []
     for m in order:
         x, f = res[m].get("xgbe"), res[m].get("float")
         if not x:
             continue
         t = x["tool_report"]
+        if f and (f.get("rows") != x["rows"] or f.get("row_set") != x.get("row_set")):
+            PROBLEMS.append(f"device: {m}: the float baseline was run on different rows than xgb-edge")
         rows.append([
-            f"`{m}`", _n(x["rows"]), x["differ_from_xgboost"],
+            f"`{m}`", x.get("input", "f32"), _n(x["rows"]), x["differ_from_xgboost"],
             f"{t['leaf_bits']}", _n(t["total_bytes"]), _n(x["linked_model_bytes"]),
             _n(f["linked_model_bytes"]) if f else "does not fit",
             f"{f['linked_model_bytes'] / x['linked_model_bytes']:.1f}x" if f else "-",
@@ -129,10 +133,40 @@ def device() -> str:
             f"{f['timing']['us_mean'] / x['timing']['us_mean']:.2f}x" if f else "-",
             _n(t["comparisons_worst_case"]), f"{x.get('stack_reported', t.get('stack_bytes'))} / {x['stack_measured']}",
             "pass" if x["ok"] else "FAIL"])
-    return _table(["model", "rows sent to the board", "differ from xgboost", "leaf bits",
+    text = _table(["model", "input", "rows sent to the board", "differ from xgboost", "leaf bits",
                    "flash reported by the tool (B)", "flash in the linked image (B)", "float baseline flash (B)",
                    "float / xgb-edge", "xgb-edge time (us)", "float baseline time (us)", "float / xgb-edge time",
-                   "worst-case comparisons", "stack reported / measured (B)", "result"], rows)
+                   "worst-case comparisons", "stack reported / measured (B)", "result"], rows, right=list(range(2, 15)))
+    # the summary sentences are generated too, so that they cannot drift from the table
+    both = [(res[m]["xgbe"], res[m]["float"]) for m in order if res[m].get("xgbe") and res[m].get("float")]
+    notes = []
+    for label, pick in (("float-input", lambda x: x.get("input", "f32") == "f32"),
+                        ("integer-input", lambda x: x.get("input", "f32") != "f32")):
+        sel = [(x, f) for x, f in both if pick(x) and x["tool_report"]["comparisons_worst_case"] >= 100]
+        if not sel:
+            continue
+        size = [f["linked_model_bytes"] / x["linked_model_bytes"] for x, f in sel]
+        time = [f["timing"]["us_mean"] / x["timing"]["us_mean"] for x, f in sel]
+        one = len(sel) == 1
+        notes.append(f"For the {len(sel)} {label} model{'' if one else 's'} run both ways (the toy model aside), the "
+                     f"float baseline is {min(size):.1f}" + ("" if one else f" to {max(size):.1f}")
+                     + f" times larger and takes {min(time):.2f}" + ("" if one else f" to {max(time):.2f}")
+                     + " times as long.")
+    exact = [m for m in order if res[m].get("float") and res[m]["float"].get("margins_bit_identical_to_xgboost")]
+    inexact = [m for m in order if res[m].get("float") and not res[m]["float"].get("margins_bit_identical_to_xgboost")]
+    if exact or inexact:
+        notes.append(f"The float baseline's margins on the board were bit-identical to XGBoost's for {len(exact)} of "
+                     f"{len(exact) + len(inexact)} models"
+                     + (f"; not for {', '.join('`' + m + '`' for m in inexact)} (largest difference "
+                        f"{max(res[m]['float']['max_margin_diff'] for m in inexact):.1e}), where the baseline folds "
+                        "the DART tree weights into its leaves" if inexact else "") + ".")
+    partial = [m for m in order if res[m].get("xgbe") and res[m]["xgbe"].get("rows_total", 0) > res[m]["xgbe"]["rows"]]
+    if partial:
+        x = res[partial[0]]["xgbe"]
+        notes.append(f"`{partial[0]}` is exported with integer inputs, so it is run on the {x['rows']:,} of its "
+                     f"{x['rows_total']:,} test rows that are integers (the others are non-integer or missing "
+                     "values placed around thresholds); the float baseline is given the same rows.")
+    return text + "\n\n" + "\n".join("* " + n for n in notes)
 
 
 def sizes() -> str:
@@ -140,7 +174,8 @@ def sizes() -> str:
     if not d:
         return "(no size results: run python -m bench.sizes)"
     rows = d["results"]
-    _check_fresh([r for r in rows if r["variant"] == "xgb_edge"], "sizes (python -m bench.sizes --variants xgb_edge)")
+    _check_fresh([r for r in rows if r["variant"] == "xgb_edge"], "sizes (python -m bench.sizes --variants xgb_edge)",
+                 "sizes")
     models: List[str] = []
     for r in rows:
         if r["model"] not in models:
@@ -193,7 +228,7 @@ def esp32() -> str:
     rows = _load("build/parity/summary.json") or []
     pk = _load("build/packages/results.json") or {}
     if pk:
-        _check_fresh([pk], "packages (python -m harness.build_packages)")
+        _check_fresh([pk], "packages (python -m harness.build_packages)", "packages")
     else:
         PROBLEMS.append("packages: no result file; run python -m harness.build_packages")
     from harness import zoo
@@ -230,7 +265,7 @@ def oldver() -> str:
     by: Dict[str, List[Dict]] = {}
     for r in rows:
         by.setdefault(r["model"].split("/")[0], []).append(r)
-    _check_fresh(rows, "oldver")
+    _check_fresh(rows, "oldver", "oldver")
     from harness import oldver as _ov
     absent = [v for v in _ov.VERSIONS if v not in by]
     if absent:
@@ -249,7 +284,43 @@ def oldver() -> str:
     return text
 
 
-TABLES = {"parity": parity, "device": device, "sizes": sizes, "esp32": esp32, "oldver": oldver}
+def optlevels() -> str:
+    """One model at several optimisation levels, xgb-edge and the float baseline (each really re-flashed)."""
+    model = "mc5_d4_r50_hist_missing"
+    rows, seen = [], []
+    ids = set()
+    for opt in ("-Os", "-O2", "-Ofast"):
+        tag = opt.replace("-", "_")
+        x = _load(f"build/device/results/{model}__xgbe0{tag}.json")
+        f = _load(f"build/device/results/{model}__float{tag}.json")
+        if not x or not f:
+            PROBLEMS.append(f"optlevels: no on-board result for {model} at {opt}; run "
+                            f"python -m harness.device run {model} --opt={opt} (and with --kind float)")
+            continue
+        seen += [x, f]
+        ids.update({x.get("build_id"), f.get("build_id")})
+        rows.append([f"`{opt}`", _n(x["build"]["program_bytes"]), _n(x["linked_model_bytes"]),
+                     f"{x['timing']['us_mean']:,.0f}", _n(f["linked_model_bytes"]), f"{f['timing']['us_mean']:,.0f}",
+                     f"{f['timing']['us_mean'] / x['timing']['us_mean']:.2f}x"])
+    _check_fresh(seen, "optlevels", "device")
+    if seen and len(ids) != len(seen):
+        PROBLEMS.append("optlevels: two results come from the same firmware build; re-run them")
+    return _table(["compiler flag", "xgb-edge firmware (B)", "xgb-edge model (B)", "xgb-edge time (us)",
+                   "float model (B)", "float time (us)", "float / xgb-edge time"], rows)
+
+
+def flashlimit() -> str:
+    d = _load("build/device/results/flash_limit.json")
+    if not d:
+        PROBLEMS.append("flashlimit: no measurement; run python -m harness.flash_limit 798720 798724")
+        return "(no measurement: run python -m harness.flash_limit)"
+    rows = [[_n(p["program_bytes"]), "accepted, runs" if p["accepted"] else "rejected by the bootloader"]
+            for p in d["probes"]]
+    return _table(["firmware size (B)", "upload over DFU"], rows)
+
+
+TABLES = {"parity": parity, "device": device, "optlevels": optlevels, "flashlimit": flashlimit, "sizes": sizes,
+          "esp32": esp32, "oldver": oldver}
 
 
 def update_readme(path: Optional[str] = None) -> List[str]:

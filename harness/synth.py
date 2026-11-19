@@ -192,7 +192,9 @@ def xgb_reference(path: str, X: np.ndarray):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         bst = xgb.Booster(model_file=path)
-        dm = xgb.DMatrix(np.asarray(X, dtype=np.float32))
+        # a model trained on named columns only accepts data carrying the same names
+        dm = xgb.DMatrix(np.asarray(X, dtype=np.float32), feature_names=bst.feature_names,
+                         feature_types=bst.feature_types)
         objective = load(path).objective
         cls = xgb_predict_class(bst, objective, dm)
         margin = bst.predict(dm, output_margin=True).astype(np.float32).reshape(X.shape[0], -1)

@@ -3,8 +3,9 @@
     python -m harness.mutation
 
 Copies the repository to a temporary directory, applies one small, wrong
-change at a time to the quantization or the generated C (for example `<`
-instead of `<=` in the rank search) and runs tests/test_thresholds.py against
+change at a time to the quantization, the generated C or the error bounds (for
+example `<` instead of `<=` in the rank search, or a float-noise bound of
+zero) and runs tests/test_thresholds.py and tests/test_guarantee.py against
 the changed copy.  Every mutant must make the tests fail; the unchanged copy
 must pass.  Exit status is non-zero if a mutant survives.
 """
@@ -58,13 +59,33 @@ MUTANTS: List[Tuple[str, str, str, str]] = [
      'const_init = f"    q[{tp.const_slot}] = 0;', 'const_init = f"    q[{tp.const_slot}] = 1;'),
     ("missing value in a default-right slot gets code 0", "xgb_edge/codegen.py",
      'vr = f"(({qtype}){tp.missing_right_code}UL)" if missing', 'vr = f"(({qtype})0UL)" if missing'),
+    # --- the terms of the guarantee (tests/test_guarantee.py)
+    ("no slack for XGBoost's float32 softmax/sigmoid ties", "xgb_edge/analysis.py",
+     "DECISION_SLACK = 2.0 ** -21", "DECISION_SLACK = 0.0"),
+    ("SAFE_GAP ignores XGBoost's float32 noise", "xgb_edge/analysis.py",
+     "need = float(plan.err_hi.max() - plan.err_lo.min()) + 2.0 * float(noise.max()) + DECISION_SLACK",
+     "need = float(plan.err_hi.max() - plan.err_lo.min()) + DECISION_SLACK"),
+    ("per-row float32 noise bound dropped", "xgb_edge/analysis.py",
+     "nz = 1.01 * U32 * (acc_noise + np.abs(total))", "nz = 0.0 * U32 * (acc_noise + np.abs(total))"),
+    ("float32 noise bound inflated a thousandfold", "xgb_edge/analysis.py",
+     "U32 = 2.0 ** -24 ", "U32 = 2.0 ** -14 "),
+    ("leaf-error bound halved", "xgb_edge/quantize.py",
+     "hi_terms[t.group].append(float(e.max()))", "hi_terms[t.group].append(float(e.max()) * 0.5)"),
+    ("leaf-error bound ignores the bias rounding and doubles the rest", "xgb_edge/quantize.py",
+     "lo_terms[t.group].append(float(e.min()))", "lo_terms[t.group].append(float(e.min()) * 2.0)"),
+    ("leaves rounded down instead of to nearest", "xgb_edge/quantize.py",
+     "qt[leaves] = np.rint(p[leaves] * scale).astype(np.int64)", "qt[leaves] = np.floor(p[leaves] * scale).astype(np.int64)"),
+    ("header reports the wrong margin scale", "xgb_edge/codegen.py",
+     "#define {P}_MARGIN_SHIFT {lp.shift}", "#define {P}_MARGIN_SHIFT {lp.shift + 1}"),
+    ("SAFE_GAP always 1", "xgb_edge/analysis.py",
+     "return int(min(g, 2 ** 31 - 1))", "return 1"),
 ]
 
 
 def _run_tests(copy: str) -> Tuple[bool, str]:
     env = dict(os.environ, PYTHONPATH=copy, XGBE_NO_SHRINK="1")
-    r = subprocess.run([sys.executable, "-m", "pytest", "tests/test_thresholds.py", "-x", "-q",
-                        "-p", "no:cacheprovider"], cwd=copy, env=env, capture_output=True, text=True)
+    r = subprocess.run([sys.executable, "-m", "pytest", "tests/test_guarantee.py", "tests/test_thresholds.py",
+                        "-x", "-q", "-p", "no:cacheprovider"], cwd=copy, env=env, capture_output=True, text=True)
     tail = [ln for ln in r.stdout.splitlines() if ln.startswith("FAILED") or " passed" in ln or " failed" in ln]
     return r.returncode == 0, (tail[0] if tail else r.stdout[-200:]).strip()[:110]
 
@@ -94,7 +115,8 @@ def main() -> int:
                 f.write(text)
             survivors += passed
             print(f"{'SURVIVED' if passed else 'caught  '}  {label}  ({what}; {time.time() - t0:.0f} s)", flush=True)
-        print(f"\n{len(MUTANTS) - survivors} of {len(MUTANTS)} mutants caught by tests/test_thresholds.py")
+        print(f"\n{len(MUTANTS) - survivors} of {len(MUTANTS)} mutants caught by tests/test_thresholds.py "
+              "and tests/test_guarantee.py")
         return 1 if survivors else 0
 
 

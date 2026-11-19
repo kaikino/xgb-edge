@@ -490,7 +490,7 @@ def main(argv=None) -> int:
         from harness.zoo import code_stamp
         for r in rows:
             if r["variant"] == "xgb_edge":
-                r["code"] = code_stamp()     # lets harness/results.py see when the exporter has changed since
+                r["code"] = code_stamp("sizes")   # lets harness/results.py see when the code has changed since
         done = {(r["model"], r["variant"]) for r in rows}
         kept = [r for r in doc.get("results", []) if (r["model"], r["variant"]) not in done]
         merged = sorted(kept + rows, key=lambda r: (order.get(r["model"], 1 << 30), ALL_VARIANTS.index(r["variant"])))

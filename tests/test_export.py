@@ -492,6 +492,65 @@ def test_cli_reports_bad_paths_and_data_without_tracebacks(tmp_path):
     # a compiler we cannot measure with: warn, estimate, still succeed
     r = _cli("report", path, "--cc", "cc", "--cflags=-Os")
     assert r.returncode == 0 and "estimate" in r.stdout and "Traceback" not in r.stderr
+    # flags that cannot be parsed: same
+    r = _cli("report", path, '--cflags="-Os')
+    assert r.returncode == 0 and "estimate" in r.stdout and "Traceback" not in r.stderr
+    # --report-json pointing at a directory: refused before anything is written
+    out2 = tmp_path / "out2"
+    _assert_clean_error(_cli("export", path, "-o", str(out2), "--report-json", str(tmp_path)), "is a directory")
+    assert not out2.exists()
+    # broken and empty archives, an oversized CSV cell
+    (tmp_path / "bad.npz").write_bytes(b"PK\x03\x04" + b"\0" * 64)
+    _assert_clean_error(_cli("report", path, "--validation", str(tmp_path / "bad.npz")), "cannot read")
+    np.savez(tmp_path / "empty.npz")
+    _assert_clean_error(_cli("report", path, "--validation", str(tmp_path / "empty.npz")), "holds no arrays")
+    (tmp_path / "huge.csv").write_text("1,2," + "9" * 200000 + "\n")
+    _assert_clean_error(_cli("report", path, "--validation", str(tmp_path / "huge.csv")), "CSV")
+    # the header pandas writes for unnamed columns is not a sample
+    (tmp_path / "pandas.csv").write_text("0,1,2\n0.5,1.5,2.5\n3,4,5\n")
+    r = _cli("report", path, "--validation", str(tmp_path / "pandas.csv"), "--no-measure")
+    assert r.returncode == 0 and "Validation (2 samples)" in r.stdout, r.stdout[-400:]
+    # a model file with an absurd integer, and names C reserves
+    text = open(path).read()
+    assert '"id":0' in text
+    (tmp_path / "bigint.json").write_text(text.replace('"id":0', '"id":' + "9" * 5000, 1))
+    r = _cli("report", str(tmp_path / "bigint.json"))
+    assert r.returncode == 2 and r.stderr.startswith("xgb-edge: error:") and "Traceback" not in r.stderr, r.stderr[:300]
+    _assert_clean_error(_cli("export", path, "-o", str(out), "--name", "_stdint"), "underscore")
+
+
+def test_inconsistent_best_iteration_is_refused(tmp_path):
+    t = synth.SynthTree()
+    t.add_leaf(0)
+    t.split(0, 0, 0.5, False, 0.2, -0.2)
+    for value in ("-5", "7"):
+        doc = json.loads(synth.build_json([t], 2, 2))
+        doc["learner"]["attributes"] = {"best_iteration": value}
+        p = tmp_path / f"m{value}.json"
+        p.write_text(json.dumps(doc))
+        for rounds in ("auto", "all", "best"):
+            with pytest.raises(XgbEdgeError, match="best_iteration"):
+                export_model(str(p), ExportOptions(rounds=rounds))
+
+
+def test_auto_width_reports_the_real_reason_when_nothing_fits(tmp_path):
+    trees = []
+    for i in range(40):
+        t = synth.SynthTree()
+        t.add_leaf(0)
+        t.split(0, 0, float(i), False, 3.0e7, -3.0e7)
+        trees.append(t)
+    path = synth.write_model(str(tmp_path / "m.json"), trees, 1, 2)
+    with pytest.raises(UnsupportedModelError) as e_auto:
+        export_model(path, ExportOptions(leaf_bits="auto"))
+    with pytest.raises(UnsupportedModelError) as e_32:
+        export_model(path, ExportOptions(leaf_bits=32))
+    assert str(e_auto.value) == str(e_32.value) and "accumulator" in str(e_auto.value)
+    stump = synth.SynthTree()
+    stump.add_leaf(0)
+    stump.split(0, 0, 0.5, False, 14.4, -3.0)
+    with pytest.raises(UnsupportedModelError, match="at least 5 bits"):
+        export_model(synth.write_model(str(tmp_path / "s.json"), [stump], 1, 2), ExportOptions(leaf_bits=3))
 
 
 def test_avr_report_counts_the_tables_as_ram(tmp_path):

@@ -25,7 +25,8 @@ from harness.parity import check_variant, print_table  # noqa: E402
 from xgb_edge import load  # noqa: E402
 from xgb_edge.refsim import leaf_indices  # noqa: E402
 
-VERSIONS = ["1.6.2", "1.7.6", "2.0.3", "2.1.4", "3.0.5"]
+#: 3.1.3 and 3.2.0 straddle the release that started bounding a binary:logistic base score
+VERSIONS = ["1.6.2", "1.7.6", "2.0.3", "2.1.4", "3.0.5", "3.1.3", "3.2.0"]
 OUT = os.path.join(zoo.ROOT, "build", "oldver")
 CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oldver_child.py")
 
@@ -110,7 +111,7 @@ def main(argv=None) -> int:
     print(f"\n{len(rows)} exports from xgboost {', '.join(versions)}: {len(rows) - len(failed)} ok, {len(failed)} failed")
     # merge by version, so that checking one release does not drop the others from the summary
     path = os.path.join(OUT, "summary.json")
-    stamp = zoo.code_stamp()
+    stamp = zoo.code_stamp("oldver")
     for r in rows:
         r["code"] = stamp
     old = []

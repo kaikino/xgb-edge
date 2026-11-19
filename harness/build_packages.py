@@ -834,7 +834,7 @@ def main(argv=None) -> int:
     info, dirs, marks = make_packages(kinds, work_root, args.inject_warning)
     from harness.zoo import code_stamp
     results: Dict = {
-        "code": code_stamp(),
+        "code": code_stamp("packages"),
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "host": {"system": platform.system(), "release": platform.release(), "machine": platform.machine(),
                  "python": platform.python_version()},

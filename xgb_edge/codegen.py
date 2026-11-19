@@ -54,10 +54,18 @@ stdalign stdarg stdatomic stdbool stddef stdint stdio stdlib stdnoreturn string 
 wctype""".split())
 
 
+#: Other header names a build is likely to include from a system or SDK directory.
+_OTHER_HEADERS = frozenset("arduino availability fcntl sdkconfig targetconditionals unistd zephyr".split())
+
+
 def check_name(name: str) -> str:
     if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
         raise XgbEdgeError(f"model name {name!r} is not a valid C identifier")
-    if name.lower() in _STD_HEADERS:
+    if name.startswith("_"):
+        # reserved for the implementation in C, and where C libraries keep internal headers (_stdint.h, ...)
+        raise XgbEdgeError(f"model name {name!r} starts with an underscore; such names are reserved in C. "
+                           "Choose another name")
+    if name.lower() in _STD_HEADERS or name.lower() in _OTHER_HEADERS:
         raise XgbEdgeError(f"model name {name!r} would produce {name}.h, which hides the standard C header "
                            "of that name; choose another name")
     return name

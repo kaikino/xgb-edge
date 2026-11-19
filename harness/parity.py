@@ -58,6 +58,13 @@ int main(int argc, char **argv)
     long rows = argc > 1 ? atol(argv[1]) : 0, r;
     static @CTYPE@ x[NF + 1];
     static int32_t out[NM + 3];
+    if (argc > 1 && argv[1][0] == 'm') {   /* what the header tells a user of the model */
+        printf("NUM_FEATURES %ld\nNUM_CLASSES %ld\nNUM_MARGINS %ld\nMARGIN_SHIFT %ld\nSAFE_GAP %ld\n"
+               "FEATURE_BYTES %ld\n", (long)@UNAME@_NUM_FEATURES, (long)@UNAME@_NUM_CLASSES,
+               (long)@UNAME@_NUM_MARGINS, (long)@UNAME@_MARGIN_SHIFT, (long)@UNAME@_SAFE_GAP,
+               (long)sizeof(@NAME@_feature_t));
+        return 0;
+    }
     for (r = 0; r < rows; r++) {
         if (NF > 0 && fread(x, sizeof x[0], NF, stdin) != (size_t)NF) return 2;
         out[2] = @NAME@_predict(x, NULL);
@@ -99,14 +106,23 @@ def run_host(exe: str, inputs: np.ndarray, n_margins: int):
     return out[:, 0].astype(np.int64), out[:, 3:].astype(np.int64), out[:, 1].astype(np.int64), out[:, 2].astype(np.int64)
 
 
+def host_macros(exe: str) -> Dict[str, int]:
+    """The macros of the generated header, as the compiled C sees them."""
+    r = subprocess.run([exe, "macros"], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("could not read the header macros: " + r.stderr[-500:])
+    return {k: int(v) for k, v in (line.split() for line in r.stdout.splitlines() if line.strip())}
+
+
 def rows_for_input(X: np.ndarray, input_kind: str) -> np.ndarray:
     """Indices of the test rows representable in the given device input type."""
     kind = INPUT_KINDS[input_kind]
     if kind.is_float:
         return np.arange(X.shape[0])
+    X64 = X.astype(np.float64)   # float32(2**31 - 1) is 2**31: compare exactly
     with np.errstate(invalid="ignore"):
-        ok = ~np.isnan(X).any(axis=1) & (X == np.rint(X)).all(axis=1) \
-            & (X >= kind.lo).all(axis=1) & (X <= kind.hi).all(axis=1)
+        ok = ~np.isnan(X64).any(axis=1) & (X64 == np.rint(X64)).all(axis=1) \
+            & (X64 >= kind.lo).all(axis=1) & (X64 <= kind.hi).all(axis=1)
     return np.nonzero(ok)[0]
 
 
@@ -139,6 +155,14 @@ def check_variant(tr: zoo.Trained, model, opts: Dict, workdir: str, cross_cc: Op
     exe = compile_host(exp, workdir)
     c_class, c_margin, c_cmp, c_class_null = run_host(exe, exp.device_inputs(X), model.n_groups)
 
+    # what the generated header tells its user must be what the exporter worked with
+    macros = host_macros(exe)
+    want = {"NUM_FEATURES": model.n_features, "NUM_CLASSES": model.n_classes, "NUM_MARGINS": model.n_groups,
+            "MARGIN_SHIFT": exp.lplan.shift, "SAFE_GAP": exp.safe_gap,
+            "FEATURE_BYTES": INPUT_KINDS[options.input].cut_bytes if options.input != "f32" else 4}
+    if macros != want:
+        fails.append(f"header macros {macros} differ from the export {want}")
+
     # C == exact integer simulation
     if not np.array_equal(c_margin, ev.integer):
         bad = np.nonzero((c_margin != ev.integer).any(axis=1))[0]
@@ -148,7 +172,7 @@ def check_variant(tr: zoo.Trained, model, opts: Dict, workdir: str, cross_cc: Op
     if not np.array_equal(c_class, c_class_null):
         fails.append("predict(x, NULL) returns a different class than predict(x, margins)")
 
-    scale = 2.0 ** -lp.shift
+    scale = 2.0 ** -macros["MARGIN_SHIFT"]     # as a user of the header would scale the margins
     sh = ev.shared
     # the tool's own bound: integer vs exact.  `exact` is a float64 sum, so allow its own
     # (bounded) representation error; the integer side is exact.
@@ -158,9 +182,7 @@ def check_variant(tr: zoo.Trained, model, opts: Dict, workdir: str, cross_cc: Op
         fails.append("integer margin error exceeds the reported worst-case bound")
 
     from xgb_edge.analysis import DECISION_SLACK, integer_gap
-    certain = integer_gap(c_margin, model.is_binary) > exp.safe_gap
-    if f"_SAFE_GAP {exp.safe_gap}L" not in exp.generated.header:
-        fails.append("SAFE_GAP macro missing from the header")
+    certain = integer_gap(c_margin, model.is_binary) > macros["SAFE_GAP"]
     res["uncertain"] = int((~certain).sum())
     differ = np.zeros(sel.size, dtype=bool)
     for label, r_class, r_margin in refs:
@@ -205,6 +227,10 @@ def check_variant(tr: zoo.Trained, model, opts: Dict, workdir: str, cross_cc: Op
         i = int(np.nonzero(over)[0][0])
         fails.append(f"{int(over.sum())} rows were flagged as at risk although xgboost's own margins are far "
                      f"from a tie (row {sel[i]}: gap {xgb_gap[i]:.3g}, limit {limit[i]:.3g})")
+
+    # the bounds themselves, recomputed without the exporter's bound code (see harness/independent.py)
+    from harness import independent
+    fails.extend(independent.check(model, exp, tr.xgb_leaf[sel], c_margin, macros))
 
     # comparisons
     cw = rep["comparisons_worst_case"]
