@@ -353,7 +353,7 @@ def flash_and_open(serial: str, sketch_dir: str, build: Dict, build_id: int, for
 
 def run_model(model_name: str, variant: int = 0, kind: str = "xgbe", board: str = "A", opt: str = "-Os",
               reps: int = 3, max_rows: Optional[int] = None, force_upload: bool = False,
-              quiet: bool = False) -> Dict:
+              quiet: bool = False, label: str = "") -> Dict:
     serial = board_serial(board)
     spec = zoo.by_name(model_name)
     tr = zoo.train(spec)
@@ -455,7 +455,7 @@ def run_model(model_name: str, variant: int = 0, kind: str = "xgbe", board: str 
         res["max_margin_diff"] = float(np.abs(margins.astype(np.float64) - xgb_margin).max())
     res["ok"] = not fails
     os.makedirs(os.path.join(DEVDIR, "results"), exist_ok=True)
-    out = os.path.join(DEVDIR, "results", f"{tag}{opt.replace('-', '_')}.json")
+    out = os.path.join(DEVDIR, "results", f"{tag}{opt.replace('-', '_')}{('.' + label) if label else ''}.json")
     with open(out, "w") as f:
         json.dump(res, f, indent=1)
     t = res["timing"]
@@ -524,6 +524,7 @@ def main(argv=None) -> int:
     r.add_argument("--reps", type=int, default=3)
     r.add_argument("--rows", type=int, default=None)
     r.add_argument("--force-upload", action="store_true")
+    r.add_argument("--label", default="", help="suffix for the result file (keeps a run from replacing another)")
     s = sub.add_parser("suite")
     s.add_argument("models", nargs="*", help="zoo models (default: the on-device subset)")
     s.add_argument("--board", default="A")
@@ -543,7 +544,7 @@ def main(argv=None) -> int:
         return 0 if res["ok"] else 1
     if args.cmd == "run":
         res = run_model(args.model, args.variant, args.kind, args.board, args.opt, args.reps, args.rows,
-                        args.force_upload)
+                        args.force_upload, label=args.label)
         return 0 if res["ok"] else 1
     bad = 0
     names = args.models or [spec.name for spec in zoo.SPECS if spec.board]

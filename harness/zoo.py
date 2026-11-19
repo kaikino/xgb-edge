@@ -290,6 +290,8 @@ SPECS: List[Spec] = [
     Spec("mc16_d5_r397_hist", dict(classes=16, features=28, samples=12000, seed=13),
          _mc(16, max_depth=5, tree_method="hist", eta=0.1), 397, exports=[{}, {"leaf_bits": 16}],
          board=True, note="6352 trees, sized to fill the nRF52840: the largest model that fits in its flash"),
+    Spec("mc6_d6_r40_approx_missing", dict(classes=6, features=18, samples=8000, missing=0.1, seed=28),
+         _mc(6, max_depth=6, tree_method="approx"), 40, exports=[{}] + BOTH, note="tree_method=approx"),
     # --- structural variants
     Spec("mc4_rf_npt3", dict(classes=4, features=12, seed=14),
          _mc(4, max_depth=5, tree_method="hist", num_parallel_tree=3, subsample=0.7, colsample_bynode=0.7), 25,

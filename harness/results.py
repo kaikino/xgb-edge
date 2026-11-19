@@ -2,6 +2,7 @@
 
     python -m harness.results            # all tables, as Markdown
     python -m harness.results device     # one of: parity, device, sizes, esp32, oldver
+    python -m harness.results --update-readme   # rewrite the tables in README.md
 
 Nothing is measured here; every number comes from
   build/parity/summary.json        (python -m harness.parity)
@@ -141,7 +142,17 @@ def sizes() -> str:
             else:
                 line.append(f"{r['flash_total']:,}")
         out.append(line)
-    return _table(["model", "XGBoost nodes"] + [names[v] for v in variants], out)
+    text = _table(["model", "XGBoost nodes"] + [names[v] for v in variants], out)
+    per_node = []
+    for m in models:
+        base = next((r for r in rows if r["model"] == m and r["variant"] == "xgb_edge"), None)
+        nodes = d.get("model_info", {}).get(m, "").split(", ")[-1].replace(" nodes", "").replace(",", "")
+        if base and base.get("flash_total") and nodes.isdigit() and int(nodes) >= 1000:
+            per_node.append(base["flash_total"] / int(nodes))
+    if per_node:
+        text += (f"\n\nxgb-edge needs {min(per_node):.1f} to {max(per_node):.1f} bytes per XGBoost node "
+                 "(splits and leaves, code included) on the models with at least 1,000 nodes.")
+    return text
 
 
 def esp32() -> str:
@@ -190,8 +201,29 @@ def oldver() -> str:
 TABLES = {"parity": parity, "device": device, "sizes": sizes, "esp32": esp32, "oldver": oldver}
 
 
+def update_readme(path: Optional[str] = None) -> List[str]:
+    """Rewrite the tables between the <!-- table:NAME --> markers of the README."""
+    import re
+    path = path or os.path.join(ROOT, "README.md")
+    text = open(path).read()
+    done = []
+    for name, fn in TABLES.items():
+        pat = re.compile(rf"(<!-- table:{name} -->\n).*?(\n<!-- /table:{name} -->)", re.S)
+        if pat.search(text):
+            body = fn()
+            text = pat.sub(lambda m: m.group(1) + body + m.group(2), text)
+            done.append(name)
+    with open(path, "w") as f:
+        f.write(text)
+    return done
+
+
 def main(argv=None) -> int:
-    names = (argv if argv is not None else sys.argv[1:]) or list(TABLES)
+    args = list(argv if argv is not None else sys.argv[1:])
+    if args == ["--update-readme"]:
+        print("updated README tables: " + ", ".join(update_readme()))
+        return 0
+    names = args or list(TABLES)
     for n in names:
         if n not in TABLES:
             print(f"unknown table {n!r}; choose from {', '.join(TABLES)}", file=sys.stderr)
