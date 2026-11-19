@@ -381,7 +381,8 @@ def run_model(model_name: str, variant: int = 0, kind: str = "xgbe", board: str 
         tool = measure(exp.generated.header, exp.generated.source, MODEL_NAME, find_cross_compiler(),
                        f"{CORTEX_FLAGS} {opt}")
         res["tool_report"] = {"data_bytes": exp.report["flash"]["data_bytes"], "code_bytes": tool["code_bytes"],
-                              "total_bytes": exp.report["flash"]["data_bytes"] + tool["code_bytes"],
+                              "rodata_bytes": tool["rodata_bytes"],
+                              "total_bytes": tool["rodata_bytes"] + tool["code_bytes"],
                               "stack_bytes": tool["stack_bytes"],
                               "comparisons_worst_case": exp.report["comparisons_worst_case"]["total"],
                               "leaf_bits": exp.lplan.bits, "bytes_per_split": exp.report["layout"]["bytes_per_split"]}

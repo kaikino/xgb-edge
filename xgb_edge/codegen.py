@@ -275,12 +275,13 @@ int {name}_predict(const {name}_feature_t *features, int32_t *margins)
                                "end of each used feature's cuts in the cut table") + "[u]"
     if n_cuts:
         allcuts = np.concatenate(tp.cuts)
-        add(kind.cut_ctype, kind.cut_bytes, "cuts", allcuts,
-            "sorted split thresholds per feature (as integer keys)", 10 if kind.cut_bytes == 4 else 16)
+        cuts_name = add(kind.cut_ctype, kind.cut_bytes, "cuts", allcuts,
+                        "sorted split thresholds per feature (as integer keys)", 10 if kind.cut_bytes == 4 else 16)
     if n_groups > 1:
         bias_expr = add("int32_t", 4, "bias", lp.bias, "per-class base margin (fixed point)", 8) + "[g]"
         ge_w = pk.group_end_bytes
-        add(_UINT[ge_w], ge_w, "group_end", flat.group_end, "trees are stored grouped by class: end index per class")
+        group_end_name = add(_UINT[ge_w], ge_w, "group_end", flat.group_end,
+                             "trees are stored grouped by class: end index per class")
     else:
         bias_expr = f"{lp.bias[0]}L"
     advance = ""
@@ -288,9 +289,11 @@ int {name}_predict(const {name}_feature_t *features, int32_t *margins)
         ts_w = pk.tree_size_bytes
         ts_name = add(_UINT[ts_w], ts_w, "tree_size", pk.tree_sizes, "byte length of each tree in the node stream")
         advance = f"            tree += {ts_name}[t];\n"
-    add("uint8_t", 1, "nodes", pk.nodes, "packed split nodes", 24)
+    # add() may return the name of an earlier, identical table: always use what it returns
+    nodes_name = add("uint8_t", 1, "nodes", pk.nodes, "packed split nodes", 24)
+    leaves_name = None
     if pk.leaf_mode == "table":
-        add(_SINT[pk.leaf_table_bytes], pk.leaf_table_bytes, "leaves", pk.leaf_table,
+        leaves_name = add(_SINT[pk.leaf_table_bytes], pk.leaf_table_bytes, "leaves", pk.leaf_table,
             "distinct leaf values (fixed point)", 12)
 
     if sizes_only:
@@ -312,7 +315,7 @@ int {name}_predict(const {name}_feature_t *features, int32_t *margins)
     # leaf operand -> int32 value
     lw = pk.leaf_bytes
     if pk.leaf_mode == "table":
-        leaf_expr = f"(int32_t){name}_leaves[{_rd('p', lw)}]"
+        leaf_expr = f"(int32_t){leaves_name}[{_rd('p', lw)}]"
         leaf_decl = ""
     elif lw == 4:
         leaf_decl = "            uint32_t v;\n"
@@ -402,7 +405,7 @@ int {name}_predict(const {name}_feature_t *features, int32_t *margins)
         search = f"""            while (lo < hi) {{
                 const uint32_t mid = (lo + hi) >> 1;
                 XE_COUNT();
-                if ({name}_cuts[mid] <= key) lo = mid + 1u; else hi = mid;
+                if ({cuts_name}[mid] <= key) lo = mid + 1u; else hi = mid;
             }}
             c = lo - start;"""
         if kind.is_float:
@@ -453,7 +456,7 @@ int {name}_predict(const {name}_feature_t *features, int32_t *margins)
 int {name}_predict(const {name}_feature_t *features, int32_t *margins)
 {{
     {qtype} q[{tp.n_slots}];
-    const uint8_t *tree = {name}_nodes;
+    const uint8_t *tree = {nodes_name};
     int32_t acc = {bias_expr};
     uint32_t t;
 {quant_decl}
@@ -473,7 +476,7 @@ int {name}_predict(const {name}_feature_t *features, int32_t *margins)
 int {name}_predict(const {name}_feature_t *features, int32_t *margins)
 {{
     {qtype} q[{tp.n_slots}];
-    const uint8_t *tree = {name}_nodes;
+    const uint8_t *tree = {nodes_name};
     int32_t best_acc = 0;
     int best = 0;
     uint32_t g, t = 0;
@@ -481,7 +484,7 @@ int {name}_predict(const {name}_feature_t *features, int32_t *margins)
 {quant}
     /* 2. walk every tree (stored grouped by class), sum the leaves, keep the arg max */
     for (g = 0; g < {n_groups}u; g++) {{
-        const uint32_t tend = {name}_group_end[g];
+        const uint32_t tend = {group_end_name}[g];
         int32_t acc = {bias_expr};
         for (; t < tend; t++) {{
 {walk}        }}

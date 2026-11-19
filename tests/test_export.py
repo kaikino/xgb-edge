@@ -225,6 +225,33 @@ def test_huge_margins_still_fit_the_accumulator(tmp_path):
     assert max(exp.lplan.max_abs_acc) <= 2 ** 31 - 1
 
 
+def test_tables_with_identical_contents_are_shared_and_still_referenced(tmp_path):
+    """Identical tables are emitted once; every use must follow the surviving name."""
+    # 4 classes with one tree each and 4 features with one cut each: the class-end table,
+    # the cut-end table and (with equal tree sizes) other small tables can coincide.
+    for n_classes, n_feat in ((4, 4), (3, 3), (5, 5), (2, 2)):
+        groups = 1 if n_classes == 2 else n_classes
+        trees = []
+        for g in range(groups):
+            t = synth.SynthTree(group=g)
+            t.add_leaf(0)
+            node = 0
+            for f in range(n_feat):
+                l, r = t.split(node, f, 0.5 + f, bool(f % 2), 0.1 * (g + 1), -0.1 * (f + 1))
+                node = r
+            trees.append(t)
+        path = synth.write_model(str(tmp_path / f"m{n_classes}.json"), trees, n_feat, n_classes)
+        X = F32(np.random.RandomState(0).uniform(-1, 6, size=(200, n_feat)))
+        for opts in ({"leaf_bits": 16, "thresholds": "rank"}, {"leaf_bits": 16, "thresholds": "direct"},
+                     {"leaf_bits": 16, "thresholds": "rank", "leaf_store": "table"},
+                     {"leaf_bits": 8, "thresholds": "rank", "leaf_store": "table"}):
+            res = check_synthetic(path, X, opts, str(tmp_path / "w"), cross=True)
+            assert res["failures"] == [], (n_classes, opts, res["failures"])
+    exp = export_model(path, ExportOptions(name="m", leaf_bits=16, thresholds="rank"))
+    names = [a.name for a in exp.generated.arrays]
+    assert len(names) == len(set(names))
+
+
 # --------------------------------------------------------------------------- report and inputs
 
 def test_report_is_consistent_with_the_generated_tables(tmp_path):

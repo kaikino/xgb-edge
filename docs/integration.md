@@ -70,7 +70,7 @@ int cls = mymodel_predict(features, margins);        /* margins may be NULL */
   softmax (multi-class) or the logistic function (`binary:logistic`) to the
   real margins yourself; `mymodel_predict` itself never uses floating point.
 * The model is `const` data plus one small function: no heap, no static RAM,
-  reentrant. One call needs a little stack (a rank array of one or two bytes
+  reentrant. One call needs a little stack (a rank array of one, two or four bytes
   per feature slot plus locals); the exact numbers are in the report that
   `xgb-edge export` prints, and each example says how much its model needs.
 
@@ -239,9 +239,9 @@ XGBoost model with 250 trees (zoo model `mc5_d4_r50_hist_missing`, exported
 as `demo_model`, 22,040 bytes of model data), and each build is the example
 that ships in the package.
 
-**Every result is "compiled, not run".** Nothing was uploaded to or executed
-on a board, so the output line shown in section 2 has only been seen from
-host builds of the same example sources (see the end of this section).
+**Every result in this table is "compiled, not run".** The one exception is
+recorded separately below it: the Arduino example was also uploaded to a real
+XIAO nRF52840 and its output read back.
 
 | Platform | Target | Built with | Result (compiled, not run) |
 |---|---|---|---|
@@ -277,7 +277,20 @@ as expected, a Kconfig error when the module is not registered at all); and
 a separate ESP-IDF project with the component in `components/` and
 `PRIV_REQUIRES`.
 
-Not done: no board was flashed; nothing was built with nRF Connect SDK, with
+Run on hardware: `python -m harness.device example --board B` exports the
+Arduino package for the same model, builds its example with `-Os`, uploads it
+to a Seeed XIAO nRF52840 Sense Plus and reads the serial port. The board
+printed
+
+```
+demo_model: class 1, margins [-110264, 33593, -44637, -12703, -4387] / 2^15, self-check OK
+```
+
+which is the class and the margins xgb-edge computed at export time. The
+Zephyr and ESP-IDF examples and the ESP32 Arduino builds were **not** run on
+hardware.
+
+Not done: no ESP32 or Zephyr image was flashed; nothing was built with nRF Connect SDK, with
 the Arduino IDE (only arduino-cli), for AVR boards, or with an ESP-IDF
 release other than v6.1.1.
 

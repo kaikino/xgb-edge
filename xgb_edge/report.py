@@ -104,6 +104,10 @@ def add_flash_totals(rep: Dict, measured: Optional[Dict]) -> None:
         rep["ram"]["stack_bytes"] = measured["stack_bytes"]
         rep["ram"]["stack_source"] = "measured (-fstack-usage)"
         rep["ram"]["static_bytes"] = measured["static_ram_bytes"]
+        # A compiler may fold a table of a few elements into code (seen for toy models);
+        # the measured object is then the truth for the total.
+        fl["total_bytes"] = measured["code_bytes"] + measured["rodata_bytes"]
+        return
     else:
         fl["code_bytes"] = CODE_BYTES_ESTIMATE
         fl["code_source"] = "estimate: no cross compiler was run (see --target / --cc)"
@@ -132,8 +136,11 @@ def render(rep: Dict) -> str:
     L.append("Flash")
     for a in fl["arrays"]:
         L.append(f"  {a['name']:<28} {a['type']:>9}[{a['count']}]".ljust(56) + f"{_n(a['bytes']):>10} B  {a['what']}")
-    L.append(f"  {'model data':<54}{_n(fl['data_bytes']):>10} B  (exact)")
+    L.append(f"  {'model data':<54}{_n(fl['data_bytes']):>10} B  (the tables above)")
     if "code_bytes" in fl:
+        folded = fl["data_bytes"] - fl.get("rodata_bytes_measured", fl["data_bytes"])
+        if folded:
+            L.append(f"  {'  tables the compiler folded into code':<54}{_n(-folded):>10} B")
         L.append(f"  {'interpreter code':<54}{_n(fl['code_bytes']):>10} B  ({fl['code_source']})")
         L.append(f"  {'total':<54}{_n(fl['total_bytes']):>10} B")
     enc = ("thresholds stored in the nodes" if lay.get("threshold_encoding") == "direct"

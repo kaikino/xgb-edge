@@ -197,8 +197,14 @@ def check_variant(tr: zoo.Trained, model, opts: Dict, workdir: str, cross_cc: Op
                 m = measure(exp.generated.header, exp.generated.source, "m", cc, flags)
                 res[f"code_{target}"] = m["code_bytes"]
                 res[f"stack_{target}"] = m["stack_bytes"]
-                if m["rodata_bytes"] != rep["flash"]["data_bytes"]:
+                # .rodata must equal the emitted tables, except that a compiler may fold tables of a
+                # few elements into code (it unrolls the tiny loops that read them)
+                tiny = sum(a["bytes"] for a in rep["flash"]["arrays"] if a["count"] <= 8)
+                missing = rep["flash"]["data_bytes"] - m["rodata_bytes"]
+                if missing < 0 or missing > tiny:
                     fails.append(f"{target}: reported data size {rep['flash']['data_bytes']} != .rodata {m['rodata_bytes']}")
+                elif missing:
+                    res["folded_" + target] = missing
                 if m["static_ram_bytes"] != 0:
                     fails.append(f"{target}: generated code uses {m['static_ram_bytes']} bytes of static RAM")
             except RuntimeError as e:

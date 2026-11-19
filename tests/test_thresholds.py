@@ -13,7 +13,7 @@ import tempfile
 
 import numpy as np
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, Phase, given, settings
 from hypothesis import strategies as st
 
 from harness import synth
@@ -38,7 +38,9 @@ finite_f32 = st.one_of(
     st.floats(min_value=-300, max_value=300, width=32),
 )
 any_f32 = st.one_of(finite_f32, st.sampled_from([float("inf"), float("-inf")]))
-LONG = settings(max_examples=40, deadline=None,
+# harness/mutation.py sets XGBE_NO_SHRINK: a failing example is enough there, minimising it is not needed
+_PHASES = [Phase.explicit, Phase.reuse, Phase.generate] if os.environ.get("XGBE_NO_SHRINK") else list(Phase)
+LONG = settings(max_examples=40, deadline=None, phases=_PHASES,
                 suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large])
 
 
