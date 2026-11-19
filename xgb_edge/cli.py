@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 import numpy as np
@@ -14,21 +15,67 @@ from .model import XgbEdgeError
 from .report import DEFAULT_CFLAGS, TARGETS, add_flash_totals, find_compiler, measure, render
 
 
+_MISSING_CELLS = {"", "nan", "na", "n/a", "null", "none", "?"}
+
+
+def _load_csv(path: str) -> np.ndarray:
+    """Read a CSV of numbers strictly: an empty or NaN cell is missing, anything else must be a number.
+
+    A first line whose cells are not numbers is taken as a header and skipped;
+    text anywhere else is an error rather than a silently missing value.
+    """
+    import csv
+    rows = []
+    with open(path, newline="") as f:
+        for lineno, cells in enumerate(csv.reader(f), start=1):
+            if len(cells) == 0 or (len(cells) == 1 and cells[0].strip() == ""):
+                continue                                  # blank line
+            vals, bad = [], None
+            for col, cell in enumerate(cells, start=1):
+                c = cell.strip()
+                if c.lower() in _MISSING_CELLS:
+                    vals.append(np.nan)
+                    continue
+                try:
+                    vals.append(float(c))
+                except ValueError:
+                    bad = (col, c)
+                    break
+            if bad is not None:
+                if not rows and lineno == 1:
+                    continue                              # header line
+                raise XgbEdgeError(f"{path}, line {lineno}, column {bad[0]}: {bad[1]!r} is not a number")
+            rows.append(vals)
+    if not rows:
+        return np.zeros((0, 0), dtype=np.float64)
+    width = len(rows[0])
+    for i, r in enumerate(rows):
+        if len(r) != width:
+            raise XgbEdgeError(f"{path}: data row {i + 1} has {len(r)} columns, the first data row has {width}")
+    return np.asarray(rows, dtype=np.float64)
+
+
 def load_matrix(path: str) -> np.ndarray:
     """Load a feature matrix from .npy, .npz (first array) or .csv (empty cell = missing)."""
     ext = os.path.splitext(path)[1].lower()
+    if ext not in (".npy", ".npz", ".csv", ".txt"):
+        raise XgbEdgeError(f"unsupported data file {path!r}: use .npy, .npz or .csv")
     try:
         if ext == ".npy":
-            return np.load(path, allow_pickle=False)
-        if ext == ".npz":
+            data = np.load(path, allow_pickle=False)
+        elif ext == ".npz":
             with np.load(path, allow_pickle=False) as z:
-                return z[z.files[0]]
-        if ext in (".csv", ".txt"):
-            data = np.genfromtxt(path, delimiter=",", dtype=np.float64)
-            return data.reshape(1, -1) if data.ndim == 1 else data
-    except (OSError, ValueError) as e:
+                data = z[z.files[0]]
+        else:
+            data = _load_csv(path)
+    except XgbEdgeError:
+        raise
+    except (OSError, ValueError, IndexError, EOFError) as e:
         raise XgbEdgeError(f"cannot read {path}: {e}") from None
-    raise XgbEdgeError(f"unsupported data file {path!r}: use .npy, .npz or .csv")
+    if not (np.issubdtype(data.dtype, np.floating) or np.issubdtype(data.dtype, np.integer)
+            or data.dtype == np.bool_):
+        raise XgbEdgeError(f"{path} does not hold numbers (array type {data.dtype})")
+    return data
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -79,8 +126,16 @@ def main(argv=None) -> int:
             try:
                 opt.leaf_bits = int(opt.leaf_bits)
             except ValueError:
-                raise XgbEdgeError(f"--leaf-bits must be 'auto' or an integer, got {args.leaf_bits!r}") from None
+                raise XgbEdgeError(f"--leaf-bits must be 'auto' or a whole number, got {args.leaf_bits!r}") from None
         X = load_matrix(args.validation) if args.validation else None
+        # refuse unusable output locations before doing (and writing) anything
+        if args.report_json:
+            parent = os.path.dirname(os.path.abspath(args.report_json))
+            if not os.path.isdir(parent):
+                raise XgbEdgeError(f"--report-json: the directory {parent} does not exist")
+        out_dir = getattr(args, "out", None)
+        if out_dir is not None and os.path.exists(out_dir) and not os.path.isdir(out_dir):
+            raise XgbEdgeError(f"--out {out_dir} exists and is not a directory")
         exp = export_model(args.model, opt, X)
         measured = None
         if not args.no_measure:
@@ -91,8 +146,9 @@ def main(argv=None) -> int:
                     measured = measure(exp.generated.header, exp.generated.source, exp.generated.name,
                                        cc, args.cflags if args.cflags is not None else flags)
                     measured["target"] = args.target
-                except (OSError, RuntimeError) as e:
-                    print(f"warning: could not measure with {cc}: {e}", file=sys.stderr)
+                except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+                    print(f"warning: could not measure code size with {cc}; the report uses an estimate.\n"
+                          f"  {str(e).strip()[:600]}", file=sys.stderr)
         add_flash_totals(exp.report, measured)
         package = getattr(args, "package", None)
         if package:
@@ -111,6 +167,11 @@ def main(argv=None) -> int:
                 json.dump(exp.report, f, indent=2)
     except XgbEdgeError as e:
         print(f"xgb-edge: error: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        # an output path that is a file, a missing or read-only directory, ...
+        where = f" ({e.filename})" if getattr(e, "filename", None) else ""
+        print(f"xgb-edge: error: cannot write the output{where}: {e.strerror or e}", file=sys.stderr)
         return 2
     return 0
 

@@ -21,6 +21,17 @@ ZOO_DIR = os.path.join(ROOT, "build", "zoo")
 CACHE_VERSION = 4
 
 
+def code_stamp() -> str:
+    """Hash of the exporter's source, stored with every result so stale results can be recognised."""
+    h = hashlib.sha1()
+    pkg = os.path.join(ROOT, "xgb_edge")
+    for fn in sorted(os.listdir(pkg)):
+        if fn.endswith(".py"):
+            with open(os.path.join(pkg, fn), "rb") as f:
+                h.update(fn.encode() + b"\0" + f.read())
+    return h.hexdigest()[:12]
+
+
 @dataclass
 class Spec:
     name: str
@@ -170,6 +181,41 @@ class Trained:
     xgb_margin: np.ndarray   # float32 (n, groups)
     xgb_leaf: np.ndarray     # int32 (n, trees)
     objective: str
+    # the same rows through Booster.inplace_predict, the path XGBClassifier.predict takes
+    xgb_class_inplace: Optional[np.ndarray] = None
+    xgb_margin_inplace: Optional[np.ndarray] = None
+
+
+def inplace_reference(model_path: str, objective: str, X: np.ndarray):
+    """Class and margins from Booster.inplace_predict (what XGBClassifier.predict uses)."""
+    import xgboost as xgb
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        bst = xgb.Booster(model_file=model_path)
+        margin = np.asarray(bst.inplace_predict(X, predict_type="margin"), dtype=np.float32).reshape(X.shape[0], -1)
+        p = np.asarray(bst.inplace_predict(X))
+    if objective == "multi:softprob":
+        cls = np.argmax(p, axis=1).astype(np.int64)
+    elif objective == "multi:softmax":
+        cls = p.astype(np.int64)
+    else:
+        cls = (p > 0.5).astype(np.int64)
+    return cls, margin
+
+
+def _with_inplace(tr: "Trained") -> "Trained":
+    """Attach the in-place predictions, computing and caching them beside the model if needed."""
+    side = os.path.join(tr.dir, "ref_inplace.npz")
+    key = open(os.path.join(tr.dir, "key.txt")).read()
+    if os.path.exists(side):
+        z = np.load(side)
+        if str(z["key"]) == key:
+            tr.xgb_class_inplace, tr.xgb_margin_inplace = z["cls"], z["margin"]
+            return tr
+    cls, margin = inplace_reference(tr.model_path, tr.objective, tr.X)
+    np.savez(side, cls=cls, margin=margin, key=key)
+    tr.xgb_class_inplace, tr.xgb_margin_inplace = cls, margin
+    return tr
 
 
 def train(spec: Spec, force: bool = False) -> Trained:
@@ -180,8 +226,8 @@ def train(spec: Spec, force: bool = False) -> Trained:
     model_path = os.path.join(d, "model.json")
     if not force and os.path.exists(stamp) and open(stamp).read() == spec.key():
         z = np.load(os.path.join(d, "ref.npz"))
-        return Trained(spec, d, model_path, z["X"], int(z["n_heldout"]), z["xgb_class"],
-                       z["xgb_margin"], z["xgb_leaf"], str(z["objective"]))
+        return _with_inplace(Trained(spec, d, model_path, z["X"], int(z["n_heldout"]), z["xgb_class"],
+                                     z["xgb_margin"], z["xgb_leaf"], str(z["objective"])))
     os.makedirs(d, exist_ok=True)
     Xtr, ytr, Xte = make_data(spec.data)
     params = dict(spec.params)
@@ -216,7 +262,7 @@ def train(spec: Spec, force: bool = False) -> Trained:
         json.dump(asdict(spec), f, indent=1)
     with open(stamp, "w") as f:
         f.write(spec.key())
-    return Trained(spec, d, model_path, X, Xte.shape[0], cls, margin, leaf, model.objective)
+    return _with_inplace(Trained(spec, d, model_path, X, Xte.shape[0], cls, margin, leaf, model.objective))
 
 
 # --------------------------------------------------------------------------- the zoo

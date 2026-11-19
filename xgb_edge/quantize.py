@@ -347,7 +347,8 @@ def _quantize_at(model: Model, prods: List[np.ndarray], const_real: List[Fractio
     for t, p in zip(model.trees, prods):
         leaves = t.leaf_nodes
         qt = np.zeros(p.size, dtype=np.int64)
-        qt[leaves] = np.rint(p[leaves] * scale).astype(np.int64)  # exact: power-of-two scaling, ties to even
+        if t.n_internal:   # a single-leaf tree is folded into the bias (exactly, below), not stored
+            qt[leaves] = np.rint(p[leaves] * scale).astype(np.int64)  # exact: power-of-two scaling, ties to even
         q.append(qt)
         max_q_tree.append(int(np.abs(qt[leaves]).max()))
     bias = [int(round(c * (1 << shift))) for c in const_real]  # Fraction: exact, ties to even
@@ -355,8 +356,9 @@ def _quantize_at(model: Model, prods: List[np.ndarray], const_real: List[Fractio
 
 
 def plan_leaves(model: Model, bits: int = 16) -> LeafPlan:
-    if not 2 <= bits <= 32:
-        raise XgbEdgeError(f"leaf bits must be between 2 and 32, got {bits}")
+    if isinstance(bits, bool) or not isinstance(bits, (int, np.integer)) or not 2 <= bits <= 32:
+        raise XgbEdgeError(f"leaf bits must be a whole number between 2 and 32, got {bits!r}")
+    bits = int(bits)
     prods = leaf_products(model)
     constant = [t.n_internal == 0 for t in model.trees]
 

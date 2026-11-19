@@ -15,6 +15,10 @@ from .model import Model, Tree, XgbEdgeError
 def as_feature_matrix(X, n_features: int) -> np.ndarray:
     """Coerce input to the float32 matrix XGBoost would see."""
     X = np.asarray(X)
+    if X.dtype == np.bool_:
+        X = X.astype(np.float32)
+    if not (np.issubdtype(X.dtype, np.floating) or np.issubdtype(X.dtype, np.integer)):
+        raise XgbEdgeError(f"feature data must be numeric, got an array of type {X.dtype}")
     if X.ndim == 1:
         X = X.reshape(1, -1)
     if X.ndim != 2:

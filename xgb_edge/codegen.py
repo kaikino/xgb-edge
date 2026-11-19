@@ -48,9 +48,18 @@ class Generated:
         return sum(a.bytes for a in self.arrays)
 
 
+#: A model called "string" would be written to string.h and shadow the standard header.
+_STD_HEADERS = frozenset("""assert complex ctype errno fenv float inttypes iso646 limits locale math setjmp signal
+stdalign stdarg stdatomic stdbool stddef stdint stdio stdlib stdnoreturn string tgmath threads time uchar wchar
+wctype""".split())
+
+
 def check_name(name: str) -> str:
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
         raise XgbEdgeError(f"model name {name!r} is not a valid C identifier")
+    if name.lower() in _STD_HEADERS:
+        raise XgbEdgeError(f"model name {name!r} would produce {name}.h, which hides the standard C header "
+                           "of that name; choose another name")
     return name
 
 
@@ -177,7 +186,9 @@ def generate(model: Model, tp: ThresholdPlan, lp: LeafPlan, pk: Packed, name: st
         items = [f"{i}:{n}" for i, n in enumerate(model.feature_names)]
         lines, cur = [], ""
         for it in items:
-            it = "".join(ch if ch.isprintable() else "?" for ch in it).replace("*/", "* /")
+            # keep the names from ending or nesting the comment they are printed in
+            it = "".join(ch if ch.isprintable() and ch != "\\" else "?" for ch in it)
+            it = it.replace("*/", "* /").replace("/*", "/ *")
             if cur and len(cur) + len(it) + 2 > 92:
                 lines.append(cur)
                 cur = it

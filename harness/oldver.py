@@ -30,9 +30,16 @@ OUT = os.path.join(zoo.ROOT, "build", "oldver")
 CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oldver_child.py")
 
 
+def _child_hash() -> str:
+    import hashlib
+    with open(CHILD, "rb") as f:
+        return hashlib.sha1(f.read()).hexdigest()[:12]
+
+
 def make_reference(version: str) -> str:
     d = os.path.join(OUT, version)
-    if os.path.exists(os.path.join(d, "done")):
+    done = os.path.join(d, "done")
+    if os.path.exists(done) and open(done).read().split("\n")[0] == _child_hash():
         return d
     cmd = ["uv", "run", "--no-project", "--python", "3.11", "--with", f"xgboost=={version}",
            "--with", "numpy<2", "--with", "scikit-learn<1.6", "--with", "scipy<1.14",
@@ -41,7 +48,7 @@ def make_reference(version: str) -> str:
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"xgboost {version}: could not produce reference models:\n{(r.stdout + r.stderr)[-2500:]}")
-    open(os.path.join(d, "done"), "w").write(r.stdout.strip().splitlines()[-1])
+    open(done, "w").write(_child_hash() + "\n" + r.stdout.strip().splitlines()[-1])
     return d
 
 
@@ -63,6 +70,10 @@ def check_version(version: str) -> List[Dict]:
             head.append("float32 reference traversal differs from that version's pred_leaf")
         spec = zoo.Spec(f"{version}/{case}", {}, {}, 0)
         tr = zoo.Trained(spec, d, path, z["X"], z["X"].shape[0], z["cls"], z["margin"], z["leaf"], str(z["objective"]))
+        # the in-place path, with the class XGBClassifier.predict reported
+        tr.xgb_class_inplace, tr.xgb_margin_inplace = z["cls_sk"], z["margin_ip"]
+        if not np.array_equal(z["cls_sk"], z["cls_ip"]):
+            head.append("XGBClassifier.predict differs from the class implied by inplace_predict")
         for opts in ({}, {"leaf_bits": 16}):
             wd = os.path.join(OUT, "work", version, case, "auto" if not opts else "b16")
             r = check_variant(tr, model, opts, wd, None)
@@ -84,9 +95,23 @@ def main(argv=None) -> int:
         for f in r["failures"]:
             print("  - " + f.replace("\n", "\n    "))
     print(f"\n{len(rows)} exports from xgboost {', '.join(versions)}: {len(rows) - len(failed)} ok, {len(failed)} failed")
+    # merge by version, so that checking one release does not drop the others from the summary
+    path = os.path.join(OUT, "summary.json")
+    stamp = zoo.code_stamp()
+    for r in rows:
+        r["code"] = stamp
+    old = []
+    if os.path.exists(path):
+        try:
+            old = json.load(open(path))
+        except ValueError:
+            old = []
+    keep = [r for r in old if r["model"].split("/")[0].replace("xgboost ", "") not in versions]
     os.makedirs(OUT, exist_ok=True)
-    with open(os.path.join(OUT, "summary.json"), "w") as f:
-        json.dump(rows, f, indent=1)
+    with open(path, "w") as f:
+        json.dump(sorted(keep + rows, key=lambda r: [int(x) if x.isdigit() else 0 for x in
+                                                      r["model"].split("/")[0].replace("xgboost ", "").split(".")]),
+                  f, indent=1)
     return 1 if failed else 0
 
 

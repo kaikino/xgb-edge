@@ -62,6 +62,10 @@ class Export:
 def to_device_inputs(X, n_features: int, input_kind: str) -> np.ndarray:
     kind = INPUT_KINDS[input_kind]
     X = np.asarray(X)
+    if X.dtype == np.bool_:
+        X = X.astype(np.uint8)
+    if not (np.issubdtype(X.dtype, np.floating) or np.issubdtype(X.dtype, np.integer)):
+        raise XgbEdgeError(f"feature data must be numeric, got an array of type {X.dtype}")
     if X.ndim == 1:
         X = X.reshape(1, -1)
     if X.ndim != 2 or X.shape[1] != n_features:
@@ -76,12 +80,31 @@ def to_device_inputs(X, n_features: int, input_kind: str) -> np.ndarray:
         if not np.all(X == np.rint(X)):
             raise XgbEdgeError(
                 f"--input {kind.name} requires integer-valued features, but the data contains non-integers")
-    if X.size and (X.min() < kind.lo or X.max() > kind.hi):
-        raise XgbEdgeError(
-            f"the data has values in [{X.min()}, {X.max()}], outside the range of {kind.ctype} "
-            f"[{kind.lo}, {kind.hi}]")
+    if X.size:
+        # compare as Python numbers: float32(2**31 - 1) is 2**31, which would hide an overflow
+        lo_v, hi_v = X.min().item(), X.max().item()
+        if lo_v < kind.lo or hi_v > kind.hi:
+            raise XgbEdgeError(
+                f"the data has values in [{lo_v:g}, {hi_v:g}], outside the range of {kind.ctype} "
+                f"[{kind.lo}, {kind.hi}]")
     dtype = {"i8": np.int8, "u8": np.uint8, "i16": np.int16, "u16": np.uint16, "i32": np.int32}[kind.name]
     return np.ascontiguousarray(X.astype(dtype))
+
+
+def _whole_number(value, what: str) -> int:
+    """``value`` as an int; rejects 16.5, "abc", True and friends instead of truncating them."""
+    if isinstance(value, bool):
+        raise XgbEdgeError(f"{what}, got {value!r}")
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            pass
+    elif isinstance(value, (float, np.floating)) and float(value).is_integer():
+        return int(value)
+    raise XgbEdgeError(f"{what}, got {value!r}")
 
 
 def select_rounds(model: Model, rounds: Union[str, int], notes: List[str]) -> Model:
@@ -116,10 +139,7 @@ def select_rounds(model: Model, rounds: Union[str, int], notes: List[str]) -> Mo
             notes.append(f"exporting the first {best + 1} of {total} rounds (best_iteration {best}), "
                          "as XGBClassifier.predict() does")
         return model.first_rounds(best + 1)
-    try:
-        n = int(rounds)
-    except (TypeError, ValueError):
-        raise XgbEdgeError(f"rounds must be auto, all, best or a number, got {rounds!r}") from None
+    n = _whole_number(rounds, "rounds must be auto, all, best or a whole number")
     if not 1 <= n <= total:
         raise XgbEdgeError(f"--rounds {n} is out of range: the model has {total} boosting rounds")
     if n < total:
@@ -139,11 +159,13 @@ def export_model(model: Union[Model, str, os.PathLike], options: Optional[Export
     if not isinstance(model, Model):
         model = load(model)
 
-    notes: List[str] = []
+    for hook_name, allowed in (("min_hdr_bytes", (1, 2)), ("min_off_bytes", (1, 2, 3, 4)),
+                               ("min_leaf_bytes", (1, 2, 3, 4)), ("min_code_bytes", (1, 2))):
+        if getattr(opt, hook_name) not in allowed:
+            raise XgbEdgeError(f"{hook_name} must be one of {allowed}, got {getattr(opt, hook_name)!r}")
+    notes: List[str] = list(model.notes or [])
     model = select_rounds(model, opt.rounds, notes)
 
-    if opt.min_code_bytes not in (1, 2):
-        raise XgbEdgeError("min_code_bytes must be 1 or 2")
     if opt.thresholds not in ("auto", "rank", "direct"):
         raise XgbEdgeError(f"thresholds must be auto, rank or direct, got {opt.thresholds!r}")
     if opt.input not in INPUT_KINDS:
@@ -166,24 +188,37 @@ def export_model(model: Union[Model, str, os.PathLike], options: Optional[Export
             raise UnsupportedModelError("no fixed-point leaf width up to 32 bits can hold this model's leaves")
         if Xv is not None and Xv.shape[0] > 0:
             evals = evaluate(model, plans, Xv)
-            chosen = len(plans) - 1
+            widest = evals[-1]
+            chosen = None
             for i, ev in enumerate(evals):
-                # smallest width whose rounding puts no sample at risk beyond XGBoost's own noise
-                if not (ev.quant_risk & ~ev.shared.float_risk).any():
+                # The narrowest width at which (a) leaf rounding endangers no row that XGBoost's own
+                # float32 rounding does not already endanger, and (b) no row gets a class it would
+                # not also get at the widest width.
+                only_ours = ev.quant_risk & ~ev.shared.float_risk
+                worse = ev.differs_from_exact & ~widest.differs_from_exact
+                if not only_ours.any() and not worse.any():
                     chosen = i
                     break
+            tried = [p.bits for p in plans]
+            if chosen is None:
+                chosen = len(plans) - 1
+                left = int((evals[chosen].quant_risk & ~evals[chosen].shared.float_risk).sum())
+                notes.append(f"leaf width: none of {tried} bits keeps every validation row out of reach of leaf "
+                             f"rounding; using {plans[chosen].bits} bits, at which {left} rows are still at risk "
+                             "from leaf rounding")
+            else:
+                noisy = int(evals[chosen].shared.float_risk.sum())
+                notes.append(f"leaf width chosen automatically: {plans[chosen].bits} bits is the narrowest of "
+                             f"{tried} at which leaf rounding puts no validation row at risk"
+                             + (f" that XGBoost's own float32 rounding does not already put at risk ({noisy} rows "
+                                "are that close to a tie at any width)" if noisy else ""))
             lplan, evaluation = plans[chosen], evals[chosen]
-            notes.append(f"leaf width chosen automatically: {lplan.bits} bits is the narrowest of "
-                         f"{[p.bits for p in plans]} that puts no validation sample at risk")
         else:
             lplan = next((p for p in plans if p.bits >= DEFAULT_LEAF_BITS), plans[-1])
             notes.append(f"no validation data given: using the default {lplan.bits}-bit leaves; "
                          "pass validation data to check the tie risk and pick the width automatically")
     else:
-        try:
-            bits = int(opt.leaf_bits)
-        except (TypeError, ValueError):
-            raise XgbEdgeError(f"leaf_bits must be 'auto' or an integer, got {opt.leaf_bits!r}") from None
+        bits = _whole_number(opt.leaf_bits, "leaf_bits must be 'auto' or a whole number")
         lplan = plan_leaves(model, bits)
         if Xv is not None and Xv.shape[0] > 0:
             evaluation = evaluate(model, [lplan], Xv)[0]

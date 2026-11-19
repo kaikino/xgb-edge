@@ -76,7 +76,7 @@ def test_rounds_all_matches_booster_predict(early_stopped, tmp_path):
     bst = clf.get_booster()
     want = xgb_predict_class(bst, "multi:softprob", xgb.DMatrix(X))
     safe = ~exp.evaluation.at_risk
-    assert np.array_equal(cls[safe], want[safe])
+    assert np.array_equal(cls[safe], want[safe]) and safe.mean() > 0.9
     assert len(exp.model.trees) == exp.model.n_rounds * 4
 
 
@@ -87,7 +87,7 @@ def test_rounds_number_matches_iteration_range(early_stopped, tmp_path):
     cls, _ = _c_classes(exp, X, tmp_path)
     p = clf.get_booster().predict(xgb.DMatrix(X), iteration_range=(0, 2))
     safe = ~exp.evaluation.at_risk
-    assert np.array_equal(cls[safe], np.argmax(p, axis=1)[safe])
+    assert np.array_equal(cls[safe], np.argmax(p, axis=1)[safe]) and safe.mean() > 0.9
     for bad in (0, 10 ** 6, "sometimes"):
         with pytest.raises(XgbEdgeError, match="rounds"):
             export_model(path, ExportOptions(name="m", rounds=bad))
@@ -127,7 +127,7 @@ def test_two_class_softprob_is_a_two_margin_model(tmp_path):
     assert res["failures"] == []
 
 
-def test_model_with_zero_trees(tmp_path):
+def test_model_with_zero_trees_is_refused(tmp_path):
     import xgboost as xgb
     X, y = _data(300, 5, 3)
     with warnings.catch_warnings():
@@ -136,10 +136,96 @@ def test_model_with_zero_trees(tmp_path):
                         xgb.DMatrix(X, label=y), num_boost_round=0)
     path = str(tmp_path / "m.json")
     bst.save_model(path)
+    with pytest.raises(UnsupportedModelError, match="no trees"):
+        export_model(path)
+
+
+def test_model_without_any_split_is_a_constant(tmp_path):
+    trees = [synth.SynthTree.single_leaf(v, group=g) for g, v in ((0, 0.1), (1, 0.3), (2, -0.2), (1, 0.05))]
+    path = synth.write_model(str(tmp_path / "m.json"), trees, 4, 3)
+    X = F32(np.random.RandomState(0).randn(50, 4))
     exp = export_model(path, ExportOptions(name="m"), validation=X)
     cls, margin = _c_classes(exp, X, tmp_path)
     assert exp.report["flash"]["data_bytes"] == 0 and exp.report["comparisons_worst_case"]["total"] == 0
-    assert (cls == cls[0]).all() and (margin == margin[0]).all()
+    assert (cls == 1).all() and (margin == margin[0]).all()
+    assert check_synthetic(path, X, {"leaf_bits": 16}, str(tmp_path / "w"))["failures"] == []
+
+
+# --------------------------------------------------------------------------- binary:logistic base_score
+
+@pytest.mark.parametrize("base_score", [1e-10, 1e-7, 0.9999999, 0.25])
+def test_extreme_logistic_base_score_matches_xgboost(tmp_path, base_score):
+    """XGBoost >= 3.2 bounds the base score to [1e-6, 1 - 1e-6] before taking the logit."""
+    import xgboost as xgb
+    X, y = _data(2500, 8, 2, seed=3)
+    y = np.where(np.random.RandomState(1).rand(y.size) < 0.3, 1 - y, y)       # noisy labels: margins near 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        bst = xgb.train(dict(objective="binary:logistic", max_depth=3, base_score=base_score, verbosity=0),
+                        xgb.DMatrix(X[:1500], label=y[:1500]), num_boost_round=40)
+    path = str(tmp_path / "m.json")
+    bst.save_model(path)
+    res = check_synthetic(path, X[1500:], {"leaf_bits": 24}, str(tmp_path / "w"))
+    assert res["failures"] == [], res["failures"]
+    exp = export_model(path, ExportOptions(name="m"))
+    noted = any("base_score" in n for n in exp.report["notes"])
+    assert noted == (not 1e-6 <= base_score <= 1 - 1e-6)
+
+
+@pytest.mark.parametrize("label", [0, 1])
+def test_one_class_training_labels(tmp_path, label):
+    """All labels equal: xgboost stores base_score 0 or 1 and still predicts."""
+    import xgboost as xgb
+    X, _ = _data(400, 5, 2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        bst = xgb.train(dict(objective="binary:logistic", max_depth=2, verbosity=0),
+                        xgb.DMatrix(X, label=np.full(400, label)), num_boost_round=3)
+    path = str(tmp_path / "m.json")
+    bst.save_model(path)
+    res = check_synthetic(path, X[:100], {"leaf_bits": 16}, str(tmp_path / "w"))
+    assert res["failures"] == [], res["failures"]
+
+
+# --------------------------------------------------------------------------- automatic leaf width
+
+def _near_tie_model(tmp_path, spread):
+    """Three classes whose margins differ by about ``spread``."""
+    rng = np.random.RandomState(0)
+    trees = []
+    for g in range(3):
+        for _ in range(8):
+            t = synth.SynthTree(group=g)
+            t.add_leaf(0)
+            t.split(0, int(rng.randint(3)), float(rng.randn()), False,
+                    0.25 + spread * rng.randn(), 0.25 + spread * rng.randn())
+            trees.append(t)
+    return synth.write_model(str(tmp_path / "m.json"), trees, 3, 3), F32(rng.randn(300, 3))
+
+
+def test_auto_note_when_no_width_is_enough(tmp_path):
+    path, X = _near_tie_model(tmp_path, 3e-9)          # gaps below what even 32-bit leaves resolve
+    exp = export_model(path, ExportOptions(name="m"), validation=X)
+    note = " ".join(exp.report["notes"])
+    ev = exp.evaluation
+    still = int((ev.quant_risk & ~ev.shared.float_risk).sum())
+    if still:
+        assert exp.lplan.bits == 32 and "none of" in note and f"{still} rows are still at risk" in note
+    else:
+        assert "narrowest" in note
+    assert "puts no validation sample at risk" not in note
+
+
+def test_auto_does_not_pick_a_width_that_changes_classes(tmp_path):
+    """When every row is a near-tie for xgboost itself, narrow leaves must not be called harmless."""
+    path, X = _near_tie_model(tmp_path, 2e-7)
+    auto = export_model(path, ExportOptions(name="m"), validation=X)
+    wide = export_model(path, ExportOptions(name="m", leaf_bits=32), validation=X)
+    worse = auto.evaluation.differs_from_exact & ~wide.evaluation.differs_from_exact
+    assert not worse.any()
+    narrow = export_model(path, ExportOptions(name="m", leaf_bits=8), validation=X)
+    if (narrow.evaluation.differs_from_exact & ~wide.evaluation.differs_from_exact).any():
+        assert auto.lplan.bits > 8
 
 
 def test_shared_leaf_table_is_chosen_when_it_is_smaller(tmp_path):
@@ -295,7 +381,41 @@ def test_integer_input_data_is_validated(tmp_path):
         export_model(path, ExportOptions(input="f64"))
     with pytest.raises(XgbEdgeError, match="C identifier"):
         export_model(path, ExportOptions(name="my model"))
+    for std in ("string", "stdint", "math"):
+        with pytest.raises(XgbEdgeError, match="standard C header"):
+            export_model(path, ExportOptions(name=std))
     assert to_device_inputs(F32([[3, -4]]), 2, "i8").dtype == np.int8
+    with pytest.raises(XgbEdgeError, match="numeric"):
+        export_model(path, ExportOptions(), validation=np.array([["a", "b"]]))
+    with pytest.raises(XgbEdgeError, match="outside the range"):
+        export_model(path, ExportOptions(input="i32"), validation=np.array([[2147483648.0, 0.0]]))
+    for bad in (16.5, "16.5", True, None):
+        with pytest.raises(XgbEdgeError, match="leaf"):
+            export_model(path, ExportOptions(leaf_bits=bad))
+    with pytest.raises(XgbEdgeError, match="rounds"):
+        export_model(path, ExportOptions(rounds=1.5))
+    for hook in ("min_leaf_bytes", "min_off_bytes", "min_hdr_bytes", "min_code_bytes"):
+        with pytest.raises(XgbEdgeError, match=hook):
+            export_model(path, ExportOptions(**{hook: 5}))
+
+
+def test_awkward_feature_names_do_not_break_the_header(tmp_path):
+    import xgboost as xgb
+    names = ["accel/*g", "end*/x", "back\\slash\\", "tab\there", "ok", "ünïcode"]
+    X, y = _data(300, 6, 3)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        bst = xgb.train(dict(objective="multi:softprob", num_class=3, max_depth=2, verbosity=0),
+                        xgb.DMatrix(X, label=y, feature_names=names), num_boost_round=3)
+    path = str(tmp_path / "m.json")
+    bst.save_model(path)
+    exp = export_model(path, ExportOptions(name="m"))
+    exp.write(str(tmp_path))
+    (tmp_path / "use.c").write_text('#include "m.h"\nint use(const float *x) { return m_predict(x, 0); }\n')
+    for cc in (["cc", "-std=c99"], ["c++", "-x", "c++", "-std=c++11"]):
+        r = subprocess.run(cc + ["-Wall", "-Wextra", "-Wpedantic", "-Werror", "-c", str(tmp_path / "use.c"), "-o",
+                                 str(tmp_path / "use.o")], capture_output=True, text=True)
+        assert r.returncode == 0 and not r.stderr, r.stderr
 
 
 def _cli(*args):
@@ -328,3 +448,66 @@ def test_cli_export_and_report(tmp_path):
     assert r3.returncode == 2 and "xgb-edge: error:" in r3.stderr and "Traceback" not in r3.stderr
     r4 = _cli("export", path, "-o", str(out), "--leaf-bits", "nope")
     assert r4.returncode == 2 and "leaf-bits" in r4.stderr
+
+
+def _assert_clean_error(r, *words):
+    assert r.returncode == 2, (r.returncode, r.stderr)
+    assert r.stderr.startswith("xgb-edge: error:") and "Traceback" not in r.stderr, r.stderr
+    for w in words:
+        assert w in r.stderr, (w, r.stderr)
+
+
+def test_cli_reports_bad_paths_and_data_without_tracebacks(tmp_path):
+    path = synth.write_model(str(tmp_path / "m.json"), [synth.SynthTree.single_leaf(0.1)], 3, 2)
+    t = synth.SynthTree()
+    t.add_leaf(0)
+    t.split(0, 1, 0.5, False, 0.2, -0.2)
+    path = synth.write_model(str(tmp_path / "m.json"), [t], 3, 2)
+    out = tmp_path / "out"
+    _assert_clean_error(_cli("export", str(tmp_path / "nope.json"), "-o", str(out)), "cannot read the model file")
+    _assert_clean_error(_cli("export", str(tmp_path), "-o", str(out)), "cannot read the model file")
+    afile = tmp_path / "afile"
+    afile.write_text("x")
+    _assert_clean_error(_cli("export", path, "-o", str(afile)), "not a directory")
+    _assert_clean_error(_cli("export", path, "-o", str(out), "--report-json", str(tmp_path / "no" / "r.json")),
+                        "--report-json")
+    assert not out.exists(), "nothing may be written when an output location is unusable"
+    _assert_clean_error(_cli("report", path, "--leaf-bits", "16.5"), "leaf-bits")
+    _assert_clean_error(_cli("report", path, "--rounds", "1.5"), "rounds")
+    _assert_clean_error(_cli("export", path, "-o", str(out), "--name", "string"), "standard C header")
+    np.save(tmp_path / "text.npy", np.array([["a", "b", "c"]]))
+    _assert_clean_error(_cli("report", path, "--validation", str(tmp_path / "text.npy")), "numbers")
+    _assert_clean_error(_cli("report", path, "--validation", str(tmp_path / "x.parquet")), "unsupported data file")
+    # a CSV: the header line is skipped, an empty or NaN cell is missing, text elsewhere is an error
+    good = tmp_path / "good.csv"
+    good.write_text("f0,f1,f2\n1,2,3\n,5,NaN\n\n7,8,9\n")
+    r = _cli("report", path, "--validation", str(good), "--no-measure")
+    assert r.returncode == 0 and "Validation (3 samples)" in r.stdout, r.stderr
+    bad = tmp_path / "bad.csv"
+    bad.write_text("f0,f1,f2\n1,2,3\n4,oops,6\n")
+    _assert_clean_error(_cli("report", path, "--validation", str(bad)), "line 3, column 2", "'oops' is not a number")
+    ragged = tmp_path / "ragged.csv"
+    ragged.write_text("1,2,3\n4,5\n")
+    _assert_clean_error(_cli("report", path, "--validation", str(ragged)), "columns")
+    # a compiler we cannot measure with: warn, estimate, still succeed
+    r = _cli("report", path, "--cc", "cc", "--cflags=-Os")
+    assert r.returncode == 0 and "estimate" in r.stdout and "Traceback" not in r.stderr
+
+
+def test_avr_report_counts_the_tables_as_ram(tmp_path):
+    from xgb_edge.report import available_targets
+    if "avr" not in available_targets():
+        pytest.skip("avr-gcc not installed")
+    rng = np.random.RandomState(0)
+    pools = {f: F32(rng.randn(6)) for f in range(4)}
+    trees = [synth.random_tree(rng, 4, pools, 12, group=g) for g in range(3)]
+    for t in trees:
+        for leaf in t.leaves:
+            t.value[leaf] = float(F32(rng.randn() * 0.2))
+    path = synth.write_model(str(tmp_path / "m.json"), trees, 4, 3)
+    rep = tmp_path / "rep.json"
+    r = _cli("report", path, "--target", "avr", "--report-json", str(rep))
+    assert r.returncode == 0, r.stderr
+    d = json.loads(rep.read_text())
+    assert d["ram"]["static_bytes"] >= d["flash"]["rodata_bytes_measured"] > 0
+    assert "AVR" in r.stdout and "static (.data/.bss): 0 B" not in r.stdout

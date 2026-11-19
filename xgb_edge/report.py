@@ -57,7 +57,10 @@ def available_targets() -> Dict[str, tuple]:
 
 def measure(header: str, source: str, name: str, cc: str, cflags: str = DEFAULT_CFLAGS) -> Dict:
     """Compile the generated C and read code/data/stack sizes from the object file."""
-    size_tool = re.sub(r"gcc(\.exe)?$", "size", cc)
+    size_tool = re.sub(r"(gcc|g\+\+)(\.exe)?$", "size", cc)
+    if size_tool == cc:
+        # not a GCC-style name (e.g. "cc" or "clang"): fall back to a binutils-compatible size on PATH
+        size_tool = shutil.which("size") or "size"
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, name + ".h"), "w") as f:
             f.write(header)
@@ -67,10 +70,19 @@ def measure(header: str, source: str, name: str, cc: str, cflags: str = DEFAULT_
         obj = os.path.join(d, name + ".o")
         cmd = [cc] + shlex.split(cflags) + ["-std=c99", "-Wall", "-Wextra", "-Werror", "-fstack-usage",
                                            "-ffunction-sections", "-fdata-sections", "-c", src, "-o", obj]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        except OSError as e:
+            raise RuntimeError(f"cannot run {cc}: {e}") from None
         if r.returncode != 0:
             raise RuntimeError(f"{' '.join(cmd)} failed:\n{r.stderr}")
-        r = subprocess.run([size_tool, "-A", obj], capture_output=True, text=True, check=True)
+        try:
+            r = subprocess.run([size_tool, "-A", obj], capture_output=True, text=True)
+        except OSError as e:
+            raise RuntimeError(f"cannot run {size_tool}: {e}") from None
+        if r.returncode != 0 or "section" not in r.stdout:
+            raise RuntimeError(f"{size_tool} -A cannot read the object file (need a binutils-style size tool "
+                               f"for this compiler): {(r.stderr or r.stdout).strip()[:200]}")
         text = rodata = other = 0
         for line in r.stdout.splitlines():
             parts = line.split()
@@ -104,6 +116,13 @@ def add_flash_totals(rep: Dict, measured: Optional[Dict]) -> None:
         rep["ram"]["stack_bytes"] = measured["stack_bytes"]
         rep["ram"]["stack_source"] = "measured (-fstack-usage)"
         rep["ram"]["static_bytes"] = measured["static_ram_bytes"]
+        if measured.get("target") == "avr":
+            # classic AVR copies const data to RAM at start-up unless it is placed in PROGMEM
+            rep["ram"]["static_bytes"] += measured["rodata_bytes"]
+            rep.setdefault("notes", []).append(
+                f"AVR: the {measured['rodata_bytes']:,} bytes of model tables are const data, which avr-gcc "
+                "keeps in RAM as well as flash; they are counted as static RAM above. The generated code "
+                "does not use PROGMEM.")
         # A compiler may fold a table of a few elements into code (seen for toy models);
         # the measured object is then the truth for the total.
         fl["total_bytes"] = measured["code_bytes"] + measured["rodata_bytes"]

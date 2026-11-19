@@ -128,6 +128,11 @@ def check_variant(tr: zoo.Trained, model, opts: Dict, workdir: str, cross_cc: Op
         return res
     X = tr.X[sel]
     xgb_class, xgb_margin = tr.xgb_class[sel], tr.xgb_margin[sel].astype(np.float64)
+    # every way xgboost predicts these rows: Booster.predict(DMatrix) and, where recorded,
+    # Booster.inplace_predict (the path XGBClassifier.predict takes)
+    refs = [("Booster.predict", xgb_class, xgb_margin)]
+    if tr.xgb_class_inplace is not None:
+        refs.append(("inplace_predict", tr.xgb_class_inplace[sel], tr.xgb_margin_inplace[sel].astype(np.float64)))
 
     exp = export_model(model, options, validation=X)
     ev, lp, rep = exp.evaluation, exp.lplan, exp.report
@@ -145,39 +150,61 @@ def check_variant(tr: zoo.Trained, model, opts: Dict, workdir: str, cross_cc: Op
 
     scale = 2.0 ** -lp.shift
     sh = ev.shared
-    # the tool's own bound: integer vs exact
+    # the tool's own bound: integer vs exact.  `exact` is a float64 sum, so allow its own
+    # (bounded) representation error; the integer side is exact.
     q_err = c_margin * scale - sh.exact
-    if (q_err > lp.err_hi[None, :]).any() or (q_err < lp.err_lo[None, :]).any():
+    pad = sh.f64_slack + 4.0 * np.spacing(np.abs(c_margin * scale) + np.abs(sh.exact))
+    if (q_err > lp.err_hi[None, :] + pad).any() or (q_err < lp.err_lo[None, :] - pad).any():
         fails.append("integer margin error exceeds the reported worst-case bound")
-    # xgboost's float32 margins vs exact: inside the float-noise bound
-    f_err = np.abs(xgb_margin - sh.exact)
-    if (f_err > sh.float_noise).any():
-        i = int(np.argmax((f_err - sh.float_noise).max(axis=1)))
-        fails.append(f"xgboost margin differs from the exact margin by more than the noise bound "
-                     f"(row {sel[i]}: {f_err[i].max():.3g} > {sh.float_noise[i].max():.3g})")
-    # C vs xgboost margins: inside the sum of both bounds
-    tot = np.abs(c_margin * scale - xgb_margin)
-    if (tot > lp.worst_error[None, :] + sh.float_noise).any():
-        fails.append("C margin differs from xgboost's margin by more than the reported bounds")
 
-    # classes
-    differ = c_class != xgb_class
-    unflagged = differ & ~ev.at_risk
-    if unflagged.any():
-        fails.append(f"{int(unflagged.sum())} rows differ from xgboost without having been flagged "
-                     f"(first: row {sel[np.nonzero(unflagged)[0][0]]})")
-    # the run-time certainty check: a margin gap above SAFE_GAP must always mean xgboost's class
-    from xgb_edge.analysis import integer_gap
+    from xgb_edge.analysis import DECISION_SLACK, integer_gap
     certain = integer_gap(c_margin, model.is_binary) > exp.safe_gap
-    if (differ & certain).any():
-        fails.append(f"{int((differ & certain).sum())} rows differ from xgboost although their margin gap "
-                     f"exceeds SAFE_GAP ({exp.safe_gap})")
     if f"_SAFE_GAP {exp.safe_gap}L" not in exp.generated.header:
         fails.append("SAFE_GAP macro missing from the header")
     res["uncertain"] = int((~certain).sum())
-    # where xgboost's own rounding cannot matter, xgboost must agree with exact arithmetic
-    if (xgb_class[~sh.float_risk] != sh.ref_class[~sh.float_risk]).any():
-        fails.append("xgboost disagrees with exact arithmetic on a row not flagged for float32 noise")
+    differ = np.zeros(sel.size, dtype=bool)
+    for label, r_class, r_margin in refs:
+        # xgboost's float32 margins vs exact: inside the float-noise bound
+        f_err = np.abs(r_margin - sh.exact)
+        if (f_err > sh.float_noise).any():
+            i = int(np.argmax((f_err - sh.float_noise).max(axis=1)))
+            fails.append(f"{label}: xgboost margin differs from the exact margin by more than the noise bound "
+                         f"(row {sel[i]}: {f_err[i].max():.3g} > {sh.float_noise[i].max():.3g})")
+        # C vs xgboost margins: inside the sum of both bounds
+        tot = np.abs(c_margin * scale - r_margin)
+        if (tot > lp.worst_error[None, :] + sh.float_noise + pad).any():
+            fails.append(f"{label}: C margin differs from xgboost's margin by more than the reported bounds")
+        # classes
+        d = c_class != r_class
+        differ |= d
+        unflagged_here = d & ~ev.at_risk
+        if unflagged_here.any():
+            fails.append(f"{label}: {int(unflagged_here.sum())} rows differ from xgboost without having been "
+                         f"flagged (first: row {sel[np.nonzero(unflagged_here)[0][0]]})")
+        # the run-time certainty check: a margin gap above SAFE_GAP must always mean xgboost's class
+        if (d & certain).any():
+            fails.append(f"{label}: {int((d & certain).sum())} rows differ from xgboost although their margin "
+                         f"gap exceeds SAFE_GAP ({exp.safe_gap})")
+        # where xgboost's own rounding cannot matter, xgboost must agree with exact arithmetic
+        if (r_class[~sh.float_risk] != sh.ref_class[~sh.float_risk]).any():
+            fails.append(f"{label}: xgboost disagrees with exact arithmetic on a row not flagged for float32 noise")
+    unflagged = differ & ~ev.at_risk
+
+    # Flagging must not be vacuous: a flagged row has to be close to a tie in xgboost's own
+    # float32 margins as well (otherwise "flag everything" would pass all the checks above).
+    noise_row = sh.float_noise.max(axis=1)
+    limit = np.maximum(2.0 * float(lp.worst_error.max()), 2.0 * noise_row + DECISION_SLACK) + 2.0 * noise_row \
+        + 4.0 * sh.f64_slack.max(axis=1)
+    if model.is_binary:
+        xgb_gap = np.abs(xgb_margin[:, 0])
+    else:
+        part = np.partition(xgb_margin, -2, axis=1)
+        xgb_gap = part[:, -1] - part[:, -2]
+    over = ev.at_risk & (xgb_gap > limit)
+    if over.any():
+        i = int(np.nonzero(over)[0][0])
+        fails.append(f"{int(over.sum())} rows were flagged as at risk although xgboost's own margins are far "
+                     f"from a tie (row {sel[i]}: gap {xgb_gap[i]:.3g}, limit {limit[i]:.3g})")
 
     # comparisons
     cw = rep["comparisons_worst_case"]
@@ -230,6 +257,9 @@ def check_synthetic(model_path: str, X: np.ndarray, opts: Dict, workdir: str, cr
     """Run the full set of parity checks on an arbitrary model file and feature rows."""
     from harness.synth import xgb_reference
     X = np.ascontiguousarray(X, dtype=np.float32)
+    if X.ndim != 2 or X.shape[0] == 0:
+        return {"model": os.path.basename(model_path), "variant": variant_label(opts), "rows": 0,
+                "failures": ["no test rows given"]}
     cls, margin, leaf = xgb_reference(model_path, X)
     model = load(model_path)
     head: List[str] = []
@@ -240,6 +270,7 @@ def check_synthetic(model_path: str, X: np.ndarray, opts: Dict, workdir: str, cr
                     f"(row, tree) pairs, first {tuple(bad[0])}")
     spec = zoo.Spec(os.path.basename(model_path), {}, {}, 0)
     tr = zoo.Trained(spec, workdir, model_path, X, X.shape[0], cls, margin, leaf.astype(np.int32), model.objective)
+    tr.xgb_class_inplace, tr.xgb_margin_inplace = zoo.inplace_reference(model_path, model.objective, X)
     r = check_variant(tr, model, opts, workdir, find_cross_compiler() if cross else None)
     r["failures"] = head + r["failures"]
     return r
@@ -332,10 +363,29 @@ def main(argv=None) -> int:
     targets = [t for t in available_targets() if t != "avr"]
     print(f"each export also compiled with -Wall -Wextra -Werror for: host (clang, + -Wpedantic -Wconversion), "
           f"{', '.join(targets) if targets else 'no cross compilers found'}")
-    os.makedirs(BUILD, exist_ok=True)
-    with open(os.path.join(BUILD, "summary.json"), "w") as f:
-        json.dump(rows, f, indent=1)
+    write_summary(os.path.join(BUILD, "summary.json"), rows, names)
     return 1 if failed else 0
+
+
+def write_summary(path: str, rows: List[Dict], models_run: List[str]) -> None:
+    """Merge this run into the stored summary: a run of a few models must not drop the others."""
+    stamp = zoo.code_stamp()
+    for r in rows:
+        r["code"] = stamp
+    old: List[Dict] = []
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            old = []
+    known = {s.name for s in zoo.SPECS}
+    keep = [r for r in old if r.get("model") not in models_run and r.get("model") in known]
+    order = {s.name: i for i, s in enumerate(zoo.SPECS)}
+    merged = sorted(keep + rows, key=lambda r: order.get(r["model"], len(order)))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(merged, f, indent=1)
 
 
 if __name__ == "__main__":

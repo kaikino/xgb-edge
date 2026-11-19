@@ -314,3 +314,129 @@ def test_binary_base_score_out_of_range():
     doc["learner"]["learner_model_param"]["base_score"] = "[1.5E0]"
     with pytest.raises(ModelFormatError, match="outside"):
         from_json(doc)
+
+
+# --------------------------------------------------------------------------- binary:logistic base score by release
+
+def _binary_doc(base_score: str, version):
+    doc = _doc(n_classes=2)
+    doc["learner"]["learner_model_param"]["base_score"] = base_score
+    if version is None:
+        doc.pop("version", None)
+    else:
+        doc["version"] = list(version)
+    return doc
+
+
+def test_logistic_base_score_is_bounded_only_by_releases_that_do_so():
+    clamp_lo = -math.log(1 / 1e-6 - 1)                       # logit(1e-6) = -13.8155
+    new = from_json(_binary_doc("[1E-7]", (3, 4, 1)))
+    assert abs(float(new.base_margin[0]) - clamp_lo) < 1e-4 and any("3.2" in n for n in new.notes)
+    edge = from_json(_binary_doc("[1E-7]", (3, 2, 0)))
+    assert abs(float(edge.base_margin[0]) - clamp_lo) < 1e-4
+    for old_version in ((3, 1, 3), (2, 1, 4), (1, 7, 6)):
+        old = from_json(_binary_doc("[1E-7]", old_version))
+        assert abs(float(old.base_margin[0]) - math.log(1e-7 / (1 - 1e-7))) < 1e-4       # -16.118
+        assert any("re-save" in n for n in old.notes)
+    # inside the range every release agrees and nothing needs saying
+    for version in ((3, 4, 1), (2, 1, 4), None):
+        m = from_json(_binary_doc("[2.5E-1]", version))
+        assert abs(float(m.base_margin[0]) - math.log(0.25 / 0.75)) < 1e-6 and not m.notes
+    # 0 and 1 (all labels equal) exist only where the bound exists
+    assert abs(float(from_json(_binary_doc("[0E0]", (3, 4, 1))).base_margin[0]) - clamp_lo) < 1e-4
+    assert float(from_json(_binary_doc("[1E0]", (3, 4, 1))).base_margin[0]) > 13.0
+    with pytest.raises(ModelFormatError, match="outside"):
+        from_json(_binary_doc("[0E0]", (2, 1, 4)))
+    with pytest.raises(ModelFormatError, match="finite logit"):
+        from_json(_binary_doc("[1E-40]", (2, 1, 4)))
+    assert np.isfinite(from_json(_binary_doc("[1E-40]", (3, 4, 1))).base_margin[0])
+    with pytest.raises(UnsupportedModelError, match="does not say which XGBoost release"):
+        from_json(_binary_doc("[1E-7]", None))
+
+
+def test_untrained_and_one_class_models_are_refused():
+    doc = _doc()
+    model = doc["learner"]["gradient_booster"]["model"]
+    model["trees"], model["tree_info"] = [], []
+    model["gbtree_model_param"]["num_trees"] = "0"
+    model["iteration_indptr"] = [0]
+    with pytest.raises(UnsupportedModelError, match="no trees"):
+        from_json(doc)
+    doc = _doc()
+    doc["learner"]["learner_model_param"]["num_class"] = "1"
+    with pytest.raises(UnsupportedModelError, match="num_class=1"):
+        from_json(doc)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d["learner"]["gradient_booster"]["model"]["trees"].__setitem__(0, [1, 2, 3]),
+    lambda d: d["learner"]["gradient_booster"]["model"].__setitem__("trees", {"a": 1}),
+    lambda d: _tree(d)["tree_param"].__setitem__("size_leaf_vector", float("inf")),
+    lambda d: _tree(d).__setitem__("left_children", "abc"),
+    lambda d: _tree(d).__setitem__("split_conditions", [[1.0], [2.0]]),
+    lambda d: _tree(d).__setitem__("default_left", None),
+    lambda d: d["learner"].__setitem__("learner_model_param", [1, 2]),
+    lambda d: d["learner"].__setitem__("gradient_booster", "gbtree"),
+    lambda d: d["learner"]["learner_model_param"].__setitem__("num_feature", None),
+    lambda d: d["learner"]["learner_model_param"].__setitem__("base_score", {"x": 1}),
+    lambda d: d["learner"].__setitem__("attributes", {"best_iteration": [1]}),
+    lambda d: d["learner"]["gradient_booster"]["model"].__setitem__("iteration_indptr", "x"),
+    lambda d: d.__setitem__("version", "three"),
+])
+def test_structurally_wrong_documents_give_a_format_error(mutate):
+    doc = _doc()
+    mutate(doc)
+    try:
+        from_json(doc)
+    except XgbEdgeError:
+        pass          # refused cleanly; (a mutation that happens to be harmless may also load)
+
+
+def _mutations(doc):
+    """Every JSON path in the document, for the structural fuzz below."""
+    paths = []
+
+    def walk(node, path):
+        paths.append(path)
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, path + (k,))
+        elif isinstance(node, list):
+            for i, v in enumerate(node[:6]):
+                walk(v, path + (i,))
+    walk(doc, ())
+    return paths
+
+
+_JUNK = [None, True, -1, 0, 10 ** 30, 1.5, float("nan"), float("inf"), "", "x", "1E400", [], {}, [[1]], {"a": [1]},
+         [None], ["x", 1]]
+
+
+@settings(max_examples=600, deadline=None)
+@given(data=st.data())
+def test_loader_never_fails_with_anything_but_its_own_errors(data):
+    """Replace or delete arbitrary parts of a valid model: the loader must load it or raise XgbEdgeError."""
+    doc = _doc(n_classes=data.draw(st.sampled_from([2, 3])))
+    paths = [p for p in _mutations(doc) if p]
+    for _ in range(data.draw(st.integers(1, 3))):
+        path = data.draw(st.sampled_from(paths))
+        node = doc
+        try:
+            for key in path[:-1]:
+                node = node[key]
+            if data.draw(st.booleans()) and isinstance(node, (dict, list)):
+                del node[path[-1]]
+            else:
+                node[path[-1]] = data.draw(st.sampled_from(_JUNK))
+        except (KeyError, IndexError, TypeError):
+            continue                      # an earlier mutation removed this path
+    try:
+        model = from_json(doc)
+    except XgbEdgeError:
+        return
+    # it loaded: then it must also export without a foreign exception
+    from xgb_edge import ExportOptions, export_model
+    try:
+        export_model(model, ExportOptions(name="m"))
+    except XgbEdgeError:
+        pass

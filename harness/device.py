@@ -425,7 +425,9 @@ def run_model(model_name: str, variant: int = 0, kind: str = "xgbe", board: str 
         try:
             if info["num_features"] != nf or info["num_margins"] != nm:
                 raise DeviceError("board firmware reports a different model shape")
-            res["stack_measured"] = link.stack(dev_in[0].tobytes())
+            # deepest stack use over a handful of rows (different rows walk different paths)
+            probe = dev_in[np.linspace(0, dev_in.shape[0] - 1, num=min(8, dev_in.shape[0]), dtype=int)]
+            res["stack_measured"] = max(link.stack(row.tobytes()) for row in probe)
             est = 0.0005 + 2e-6 * model.n_internal ** 0.5 * len(model.trees) ** 0.5
             cls, raw, ticks, cycles, secs = link.predict(dev_in, nm, reps, info["max_payload"], per_row_s=max(est, 0.002),
                                                          progress=not quiet)
@@ -436,6 +438,7 @@ def run_model(model_name: str, variant: int = 0, kind: str = "xgbe", board: str 
 
     differ = cls != xgb_class
     res["differ_from_xgboost"] = int(differ.sum())
+    res["code"] = zoo.code_stamp()
     if kind == "xgbe":
         ev = exp.evaluation
         margins = raw.view(np.int32).astype(np.int64)
@@ -444,6 +447,14 @@ def run_model(model_name: str, variant: int = 0, kind: str = "xgbe", board: str 
                          f"{int((margins != ev.integer).any(axis=1).sum())} rows")
         if not np.array_equal(cls, ev.int_class):
             fails.append("board class differs from the simulation")
+        # the reported stack figure is predict()'s frame: the board must not use more than that
+        res["stack_reported"] = res["tool_report"]["stack_bytes"]
+        if res["stack_reported"] is not None and res["stack_measured"] > res["stack_reported"]:
+            fails.append(f"stack measured on the board ({res['stack_measured']} B) exceeds the reported "
+                         f"{res['stack_reported']} B")
+        if tr.xgb_class_inplace is not None:
+            differ |= cls != tr.xgb_class_inplace[sel]
+            res["differ_from_xgboost"] = int(differ.sum())
         unflagged = differ & ~ev.at_risk
         res["at_risk"] = int(ev.at_risk.sum())
         res["differ_unflagged"] = int(unflagged.sum())

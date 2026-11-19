@@ -144,9 +144,12 @@ def _to_int(values, what: str) -> np.ndarray:
     if arr.dtype == np.bool_:
         return arr.astype(np.int64)
     if not np.issubdtype(arr.dtype, np.integer):
-        if np.issubdtype(arr.dtype, np.floating) and np.all(arr == np.floor(arr)):
+        if (np.issubdtype(arr.dtype, np.floating) and np.all(np.isfinite(arr)) and np.all(np.abs(arr) < 2.0 ** 53)
+                and np.all(arr == np.floor(arr))):
             return arr.astype(np.int64)
         raise ModelFormatError(f"{what}: expected integers, got {arr.dtype}")
+    if arr.dtype == np.uint64 and arr.size and arr.max() > np.iinfo(np.int64).max:
+        raise ModelFormatError(f"{what}: integer out of range")
     return arr.astype(np.int64)
 
 
@@ -207,6 +210,7 @@ class Model:
     version: tuple
     round_ptr: List[int] = None            # trees of boosting round r are [round_ptr[r], round_ptr[r + 1])
     best_iteration: Optional[int] = None   # set by early stopping; XGBClassifier.predict stops there
+    notes: List[str] = None                # things the user should know about how the file was interpreted
 
     @property
     def n_rounds(self) -> int:
@@ -353,9 +357,73 @@ def _build_tree(index: int, jt: dict, group: int, weight: float, n_features: int
 
 
 def from_json(doc: dict, hook: Optional[_FloatHook] = None) -> Model:
-    """Build a :class:`Model` from a parsed XGBoost JSON document."""
+    """Build a :class:`Model` from a parsed XGBoost JSON document.
+
+    Raises :class:`ModelFormatError` for anything that is not a well-formed
+    XGBoost model, including documents whose structure is wrong in ways the
+    individual checks do not anticipate.
+    """
+    try:
+        return _from_json(doc, hook)
+    except XgbEdgeError:
+        raise
+    except (TypeError, AttributeError, KeyError, IndexError, ValueError, OverflowError, RecursionError) as e:
+        raise ModelFormatError(
+            f"this is not a well-formed XGBoost JSON model ({type(e).__name__}: {e})") from None
+
+
+#: XGBoost >= 3.2 bounds a binary:logistic base_score to [1e-6, 1 - 1e-6] before taking the logit.
+LOGISTIC_CLAMP_SINCE = (3, 2, 0)
+_KRT_EPS = np.float32(1e-6)
+
+
+def _logistic_base_margin(p: np.float32, version: tuple, notes: List[str]) -> np.float32:
+    """XGBoost's float32 logit of a binary:logistic base_score, as the saving release computes it."""
+    one = np.float32(1.0)
+    lo, hi = _KRT_EPS, np.float32(one - _KRT_EPS)
+
+    def logit(x: np.float32) -> np.float32:
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            return np.float32(-np.log(one / x - one, dtype=np.float32))   # Logit(x) = -logf(1.0f / x - 1.0f)
+
+    inside = bool(lo <= p <= hi)
+    if inside:
+        return logit(p)
+    ver = tuple(int(v) for v in version[:3]) if len(version) >= 2 else None
+    clamped = logit(np.float32(min(max(p, lo), hi)))
+    if ver is None:
+        raise UnsupportedModelError(
+            f"base_score {p:g} is outside [1e-6, 1 - 1e-6] and the file does not say which XGBoost release "
+            "saved it. Releases from 3.2 on bound the base score to that range before converting it to a "
+            "margin, earlier ones do not, so the model's margins are ambiguous. Re-save the model with the "
+            "xgboost you predict with.")
+    if ver >= LOGISTIC_CLAMP_SINCE:
+        if not (0.0 <= float(p) <= 1.0):   # XGBoost itself refuses such a model
+            raise ModelFormatError(f"base_score {p:g} is outside [0, 1] for binary:logistic")
+        notes.append(
+            f"base_score {p:g} is outside [1e-6, 1 - 1e-6]; XGBoost {'.'.join(map(str, ver))} (3.2 and later) "
+            f"bounds it to that range, so the base margin is {float(clamped):.6g}. Releases before 3.2 would "
+            "use the unbounded logit instead.")
+        return clamped
+    if not (0.0 < float(p) < 1.0):
+        raise ModelFormatError(f"base_score {p:g} is outside (0, 1) for binary:logistic")
+    raw = logit(p)
+    if not np.isfinite(raw):
+        raise ModelFormatError(f"base_score {p:g} has no finite logit in float32")
+    notes.append(
+        f"base_score {p:g} is outside [1e-6, 1 - 1e-6]; the file was saved by XGBoost "
+        f"{'.'.join(map(str, ver))}, which uses its logit {float(raw):.6g} as the base margin. XGBoost 3.2 and "
+        f"later would bound it first and use {float(clamped):.6g}: if you predict with such a release, "
+        "re-save the model with it before exporting.")
+    return raw
+
+
+def _from_json(doc: dict, hook: Optional[_FloatHook] = None) -> Model:
+    if not isinstance(doc, dict):
+        raise ModelFormatError("the model file does not hold a JSON object")
+    notes: List[str] = []
     learner = _get(doc, "learner", "the model file")
-    version = tuple(doc.get("version", ()))
+    version = tuple(doc.get("version") or ())
     lmp = _get(learner, "learner_model_param", "learner")
     gb = _get(learner, "gradient_booster", "learner")
     booster = _get(gb, "name", "gradient_booster")
@@ -394,6 +462,10 @@ def from_json(doc: dict, hook: Optional[_FloatHook] = None) -> Model:
         raise UnsupportedModelError(
             f"the model has num_target={num_target}: multi-target / multi-label models are not supported.")
     if objective.startswith("multi:"):
+        if num_class == 1:
+            raise UnsupportedModelError(
+                f"objective {objective} with num_class=1: a one-class model predicts class 0 for every "
+                "input; there is nothing to export.")
         if num_class < 2:
             raise ModelFormatError(f"objective {objective} with num_class={num_class}")
         n_groups, n_classes = num_class, num_class
@@ -409,12 +481,7 @@ def from_json(doc: dict, hook: Optional[_FloatHook] = None) -> Model:
     base_score = _parse_base_score(_get(lmp, "base_score", "learner_model_param"), n_groups)
     ulps = 0
     if objective == "binary:logistic":
-        p = base_score[0]
-        if not (0.0 < float(p) < 1.0):
-            raise ModelFormatError(f"base_score {p} is outside (0, 1) for binary:logistic")
-        # XGBoost: Logit(x) = -logf(1.0f / x - 1.0f), evaluated in float32.
-        one = np.float32(1.0)
-        base_margin = np.array([-np.log(one / p - one, dtype=np.float32)], dtype=np.float32)
+        base_margin = np.array([_logistic_base_margin(base_score[0], version, notes)], dtype=np.float32)
         ulps = 2  # libm logf vs numpy log may differ in the last place
     else:
         base_margin = base_score.astype(np.float32)
@@ -422,6 +489,12 @@ def from_json(doc: dict, hook: Optional[_FloatHook] = None) -> Model:
     gparam = gmodel.get("gbtree_model_param", {})
     num_parallel_tree = _int_param(gparam, "num_parallel_tree", "gbtree_model_param", default=1)
     jtrees = _get(gmodel, "trees", "gradient_booster.model")
+    if not isinstance(jtrees, list):
+        raise ModelFormatError("gradient_booster.model.trees is not a list")
+    if not jtrees:
+        # An unfitted model is also where XGBoost treats base_score specially (as a placeholder).
+        raise UnsupportedModelError(
+            "the model has no trees (it was saved before any boosting round): there is nothing to export.")
     tree_info = _to_int(_get(gmodel, "tree_info", "gradient_booster.model"), "tree_info")
     if "num_trees" in gparam and _int_param(gparam, "num_trees", "gbtree_model_param") != len(jtrees):
         raise ModelFormatError(
@@ -444,6 +517,8 @@ def from_json(doc: dict, hook: Optional[_FloatHook] = None) -> Model:
 
     trees = []
     for i, jt in enumerate(jtrees):
+        if not isinstance(jt, dict):
+            raise ModelFormatError(f"tree {i} is not a JSON object")
         trees.append(_build_tree(i, jt, int(tree_info[i]), float(weights[i]), n_features,
                                  hook, feature_names))
 
@@ -474,15 +549,18 @@ def from_json(doc: dict, hook: Optional[_FloatHook] = None) -> Model:
                  n_classes=n_classes, base_margin=base_margin, base_margin_ulps=ulps,
                  trees=trees, booster=booster, num_parallel_tree=num_parallel_tree,
                  feature_names=feature_names, version=version, round_ptr=round_ptr,
-                 best_iteration=best_iteration)
+                 best_iteration=best_iteration, notes=notes)
 
 
 def load(path) -> Model:
     """Load an XGBoost model saved with ``booster.save_model("model.json")``."""
-    with open(path, "rb") as f:
-        head = f.read(1)
-        f.seek(0)
-        raw = f.read()
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1)
+            f.seek(0)
+            raw = f.read()
+    except OSError as e:
+        raise XgbEdgeError(f"cannot read the model file {path}: {e.strerror or e}") from None
     if head != b"{":
         raise ModelFormatError(
             f"{path} is not XGBoost JSON (it does not start with '{{'). If it is a UBJSON or legacy "
@@ -498,4 +576,6 @@ def load(path) -> Model:
         doc = json.loads(text, parse_float=hook)
     except json.JSONDecodeError as e:
         raise ModelFormatError(f"{path} is not valid JSON: {e}") from None
+    except RecursionError:
+        raise ModelFormatError(f"{path} is not valid JSON: nested too deeply") from None
     return from_json(doc, hook)

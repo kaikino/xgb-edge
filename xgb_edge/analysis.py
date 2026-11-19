@@ -1,10 +1,13 @@
 """Evaluate a model on sample data and decide which predictions are provably safe.
 
-For every sample we compute, in exact arithmetic:
+For every sample we compute:
 
 * ``exact``  - the real-valued margin XGBoost approximates in float32:
-               base margin + sum of (leaf value * tree weight);
-* ``integer`` - the fixed-point margin the generated C computes.
+               base margin + sum of (leaf value * tree weight), as a
+               compensated float64 sum (accurate to about 1e-16 relative to
+               the sum of magnitudes; ``f64_slack`` bounds what is left and
+               is added to every comparison below);
+* ``integer`` - the fixed-point margin the generated C computes (exactly).
 
 Two independent things can make the predicted class differ from XGBoost's:
 
@@ -40,6 +43,7 @@ class Shared:
 
     exact: np.ndarray        # float64 (n, groups): exact margins
     float_noise: np.ndarray  # float64 (n, groups): bound on |XGBoost float32 margin - exact|
+    f64_slack: np.ndarray    # float64 (n, groups): bound on the float64 error of ``exact`` itself
     ref_class: np.ndarray    # int64 (n,): class implied by the exact margins
     float_risk: np.ndarray   # bool (n,): XGBoost's own rounding could change its class
     path_len: np.ndarray     # int64 (n,): split comparisons made across all stored trees
@@ -65,6 +69,20 @@ class Evaluation:
         return self.int_class != self.shared.ref_class
 
 
+def _dart_inplace_terms(abs_w: float, abs_base: float, abs_p):
+    """Extra rounding of one DART tree on XGBoost's in-place prediction path, in units of u.
+
+    Up to XGBoost 3.0, ``inplace_predict`` (which ``XGBClassifier.predict``
+    uses) evaluates a DART tree as ``(fl(base + leaf) - base) * weight``: the
+    leaf is first rounded at the magnitude of the base score.  With
+    p = leaf * weight that adds at most u * |weight| * (|base| + 2 * |leaf|)
+    = u * (|weight| * |base| + 2 * |p|) to the tree's contribution.
+    ``Booster.predict(DMatrix)`` does not do this, but a model file does not
+    say which path will be used, so every DART model gets the wider bound.
+    """
+    return 1.001 * (abs_w * abs_base + 2.0 * abs_p)
+
+
 def _classes(margins: np.ndarray, binary: bool) -> np.ndarray:
     if binary:
         return (margins[:, 0] > 0).astype(np.int64)
@@ -77,8 +95,10 @@ def evaluate(model: Model, plans: Sequence[LeafPlan], X, chunk: int = 4096) -> L
     n, G = X.shape[0], model.n_groups
     prods = leaf_products(model)
     base = model.base_margin.astype(np.float64)
+    dart = model.booster == "dart"
     exact = np.zeros((n, G))
     noise = np.zeros((n, G))
+    slack64 = np.zeros((n, G))
     path_len = np.zeros(n, dtype=np.int64)
     integer = [np.zeros((n, G), dtype=np.int64) for _ in plans]
 
@@ -105,6 +125,8 @@ def evaluate(model: Model, plans: Sequence[LeafPlan], X, chunk: int = 4096) -> L
             # (CPU) or adding it last (GPU); each addition rounds by <= u * |partial sum|,
             # and a DART weight multiplication by <= u * |v|.
             acc_noise[:, g] += np.maximum(np.abs(cur + base[g]), np.abs(cur)) + np.abs(v)
+            if dart:
+                acc_noise[:, g] += _dart_inplace_terms(abs(tree.weight), abs(base[g]), np.abs(v))
             abs_sum[:, g] += np.abs(v)
             if tree.n_internal:
                 plen += tree.node_depth[leaf]
@@ -112,11 +134,13 @@ def evaluate(model: Model, plans: Sequence[LeafPlan], X, chunk: int = 4096) -> L
                     ints[k][:, g] += p.q[j][leaf]
         total = prefix + comp + base
         ulp_base = np.array([float(np.spacing(np.float32(abs(b)))) for b in model.base_margin])
+        f64 = 1e-15 * (abs_sum + np.abs(base)) + 1e-300   # float64 error of `total` itself
         nz = 1.01 * U32 * (acc_noise + np.abs(total)) \
             + model.base_margin_ulps * ulp_base \
-            + 1e-15 * (abs_sum + np.abs(base)) + len(model.trees) * 2.0 ** -149
+            + f64 + len(model.trees) * 2.0 ** -149
         exact[s:s + m] = total
         noise[s:s + m] = nz
+        slack64[s:s + m] = f64
         path_len[s:s + m] = plen
         for k in range(len(plans)):
             integer[k][s:s + m] = ints[k]
@@ -134,17 +158,18 @@ def evaluate(model: Model, plans: Sequence[LeafPlan], X, chunk: int = 4096) -> L
         ok = gap > need
         ok[rows, ref_class] = True
         float_safe = ok.all(axis=1)
-    shared = Shared(exact=exact, float_noise=noise, ref_class=ref_class,
+    shared = Shared(exact=exact, float_noise=noise, f64_slack=slack64, ref_class=ref_class,
                     float_risk=~float_safe, path_len=path_len)
 
     out = []
     for k, p in enumerate(plans):
         if binary:
-            r = exact[:, 0]
-            quant_safe = np.where(r > 0, r + p.err_lo[0] > 0, r + p.err_hi[0] < 0)
+            r, sl = exact[:, 0], slack64[:, 0]
+            quant_safe = np.where(r > 0, r + p.err_lo[0] > sl, r + p.err_hi[0] < -sl)
         else:
             # integer_a - integer_b >= 2**shift * (gap + err_lo[a] - err_hi[b])
-            need = p.err_hi[None, :] - p.err_lo[ref_class][:, None]
+            need = p.err_hi[None, :] - p.err_lo[ref_class][:, None] \
+                + slack64 + slack64[rows, ref_class][:, None]
             ok = gap > need
             ok[rows, ref_class] = True
             quant_safe = ok.all(axis=1)
@@ -175,6 +200,8 @@ def static_float_noise(model: Model) -> np.ndarray:
         lo[g] += pmin
         biggest = max(abs(hi[g] + base[g]), abs(lo[g] + base[g]), abs(hi[g]), abs(lo[g]))
         acc[g] += biggest + max(abs(pmax), abs(pmin))
+        if model.booster == "dart":
+            acc[g] += _dart_inplace_terms(abs(t.weight), abs(base[g]), max(abs(pmax), abs(pmin)))
         abs_sum[g] += max(abs(pmax), abs(pmin))
     total = np.maximum(np.abs(hi + base), np.abs(lo + base))
     ulp_base = np.array([float(np.spacing(np.float32(abs(b)))) for b in model.base_margin])

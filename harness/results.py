@@ -3,6 +3,7 @@
     python -m harness.results            # all tables, as Markdown
     python -m harness.results device     # one of: parity, device, sizes, esp32, oldver
     python -m harness.results --update-readme   # rewrite the tables in README.md
+    python -m harness.results --check           # are the results complete, current and what the README shows?
 
 Nothing is measured here; every number comes from
   build/parity/summary.json        (python -m harness.parity)
@@ -20,6 +21,26 @@ import sys
 from typing import Dict, List, Optional
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class Incomplete(Exception):
+    """A result file is missing, partial, or was produced by different exporter code."""
+
+
+#: problems found while building the tables (filled by the table functions)
+PROBLEMS: List[str] = []
+
+
+def _stamp() -> str:
+    from harness import zoo
+    return zoo.code_stamp()
+
+
+def _check_fresh(rows: List[Dict], what: str) -> None:
+    stale = sorted({str(r.get("code")) for r in rows if r.get("code") != _stamp()})
+    if stale:
+        PROBLEMS.append(f"{what}: results were produced by other exporter code (stamp {', '.join(stale)}, "
+                        f"current {_stamp()}); re-run it")
 
 
 def _load(rel: str):
@@ -46,9 +67,17 @@ def parity() -> str:
     rows = _load("build/parity/summary.json")
     if not rows:
         return "(no parity results: run python -m harness.parity)"
+    from harness import zoo
     by: Dict[str, List[Dict]] = {}
     for r in rows:
         by.setdefault(r["model"], []).append(r)
+    missing = [s.name for s in zoo.SPECS if s.name not in by]
+    short = [s.name for s in zoo.SPECS if s.name in by and len(by[s.name]) != len(s.exports)]
+    if missing or short:
+        PROBLEMS.append(f"parity: no complete result for {len(missing) + len(short)} zoo models "
+                        f"({', '.join((missing + short)[:5])}{', ...' if len(missing + short) > 5 else ''}); "
+                        "run python -m harness.parity")
+    _check_fresh(rows, "parity")
     out = []
     for m, rs in by.items():
         ok = all(not r["failures"] for r in rs)
@@ -81,6 +110,10 @@ def device() -> str:
     if not res:
         return "(no device results: run python -m harness.device suite)"
     order = [s.name for s in zoo.SPECS if s.name in res]
+    missing = [s.name for s in zoo.SPECS if s.board and not res.get(s.name, {}).get("xgbe")]
+    if missing:
+        PROBLEMS.append(f"device: no on-board result for {', '.join(missing)}; run python -m harness.device suite")
+    _check_fresh([r for m in res.values() for r in m.values()], "device")
     rows = []
     for m in order:
         x, f = res[m].get("xgbe"), res[m].get("float")
@@ -107,6 +140,7 @@ def sizes() -> str:
     if not d:
         return "(no size results: run python -m bench.sizes)"
     rows = d["results"]
+    _check_fresh([r for r in rows if r["variant"] == "xgb_edge"], "sizes (python -m bench.sizes --variants xgb_edge)")
     models: List[str] = []
     for r in rows:
         if r["model"] not in models:
@@ -158,6 +192,10 @@ def sizes() -> str:
 def esp32() -> str:
     rows = _load("build/parity/summary.json") or []
     pk = _load("build/packages/results.json") or {}
+    if pk:
+        _check_fresh([pk], "packages (python -m harness.build_packages)")
+    else:
+        PROBLEMS.append("packages: no result file; run python -m harness.build_packages")
     from harness import zoo
     board = [s.name for s in zoo.SPECS if s.board]
     out = []
@@ -192,6 +230,11 @@ def oldver() -> str:
     by: Dict[str, List[Dict]] = {}
     for r in rows:
         by.setdefault(r["model"].split("/")[0], []).append(r)
+    _check_fresh(rows, "oldver")
+    from harness import oldver as _ov
+    absent = [v for v in _ov.VERSIONS if v not in by]
+    if absent:
+        PROBLEMS.append(f"oldver: no result for xgboost {', '.join(absent)}; run python -m harness.oldver")
     out = [[v, len(rs), _n(sum(r.get("rows", 0) for r in rs)), sum(r.get("differ_unflagged", 0) for r in rs),
             "pass" if all(not r["failures"] for r in rs) else "FAIL"] for v, rs in sorted(by.items())]
     return _table(["xgboost version that trained and predicted", "exports", "row checks", "differ, not flagged",
@@ -220,9 +263,27 @@ def update_readme(path: Optional[str] = None) -> List[str]:
 
 def main(argv=None) -> int:
     args = list(argv if argv is not None else sys.argv[1:])
-    if args == ["--update-readme"]:
-        print("updated README tables: " + ", ".join(update_readme()))
-        return 0
+    if args and args[0] in ("--update-readme", "--check"):
+        if args[0] == "--check":
+            for fn in TABLES.values():
+                fn()
+        else:
+            print("updated README tables: " + ", ".join(update_readme()))
+        if args[0] == "--check" and not PROBLEMS:
+            # the README must show exactly what the result files say
+            import re
+            text = open(os.path.join(ROOT, "README.md")).read()
+            for name, fn in TABLES.items():
+                m = re.search(rf"<!-- table:{name} -->\n(.*?)\n<!-- /table:{name} -->", text, re.S)
+                if not m or m.group(1) != fn():
+                    PROBLEMS.append(f"README: the '{name}' table differs from the result files; "
+                                    "run python -m harness.results --update-readme")
+        for msg in dict.fromkeys(PROBLEMS):
+            print("PROBLEM: " + msg)
+        if not PROBLEMS:
+            print("result files are complete, were produced by the current exporter code, and match the README"
+                  if args[0] == "--check" else "all result files are complete and current")
+        return 1 if PROBLEMS else 0
     names = args or list(TABLES)
     for n in names:
         if n not in TABLES:

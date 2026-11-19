@@ -832,7 +832,9 @@ def main(argv=None) -> int:
     os.makedirs(work_root, exist_ok=True)
     results_file = os.path.join(OUT, "results-inject.json" if args.inject_warning else "results.json")
     info, dirs, marks = make_packages(kinds, work_root, args.inject_warning)
+    from harness.zoo import code_stamp
     results: Dict = {
+        "code": code_stamp(),
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "host": {"system": platform.system(), "release": platform.release(), "machine": platform.machine(),
                  "python": platform.python_version()},
