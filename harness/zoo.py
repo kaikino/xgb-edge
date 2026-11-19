@@ -277,7 +277,7 @@ SPECS: List[Spec] = [
          _mc(12, max_depth=8, tree_method="hist", eta=0.15), 120, exports=[{}, {"leaf_bits": 16}]),
     Spec("mc16_d5_r400_hist", dict(classes=16, features=28, samples=12000, seed=13),
          _mc(16, max_depth=5, tree_method="hist", eta=0.1), 400, exports=[{}, {"leaf_bits": 16}, {"leaf_bits": 24}],
-         note="several hundred rounds: 6400 trees"),
+         board=True, note="several hundred rounds: 6400 trees; the largest zoo model that fits the nRF52840"),
     # --- structural variants
     Spec("mc4_rf_npt3", dict(classes=4, features=12, seed=14),
          _mc(4, max_depth=5, tree_method="hist", num_parallel_tree=3, subsample=0.7, colsample_bynode=0.7), 25,

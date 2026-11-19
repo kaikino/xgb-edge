@@ -23,6 +23,7 @@ class ExportOptions:
     input: str = "f32"                    # f32, i8, u8, i16, u16, i32
     leaf_bits: Union[str, int] = "auto"   # "auto" or 2..32
     leaf_store: str = "auto"              # auto, inline, table
+    rounds: Union[str, int] = "auto"      # auto, all, best, or a number of boosting rounds
     # Test hooks: force wider fields than the model needs, to exercise every code path.
     min_code_bytes: int = 1
     min_hdr_bytes: int = 1
@@ -81,6 +82,49 @@ def to_device_inputs(X, n_features: int, input_kind: str) -> np.ndarray:
     return np.ascontiguousarray(X.astype(dtype))
 
 
+def select_rounds(model: Model, rounds: Union[str, int], notes: List[str]) -> Model:
+    """Decide how many boosting rounds to export.
+
+    A model trained with early stopping carries more trees than its best
+    iteration.  XGBClassifier.predict() silently stops at the best iteration,
+    while Booster.predict() uses every tree, so "the same predictions as
+    xgboost" is ambiguous and the caller has to say which one is meant.
+    """
+    best, total = model.best_iteration, model.n_rounds
+    if rounds == "auto":
+        if best is not None and best + 1 < total:
+            raise XgbEdgeError(
+                f"the model was trained with early stopping: it holds {total} boosting rounds but its "
+                f"best_iteration is {best}. XGBClassifier.predict() uses only the first {best + 1} rounds, "
+                f"Booster.predict() uses all {total}. Choose with --rounds best (first {best + 1} rounds, "
+                f"matches XGBClassifier.predict) or --rounds all (matches Booster.predict).")
+        return model
+    if rounds == "all":
+        if best is not None and best + 1 < total:
+            notes.append(f"exporting all {total} rounds although best_iteration is {best}: this matches "
+                         "Booster.predict(), not XGBClassifier.predict()")
+        return model
+    if rounds == "best":
+        if best is None:
+            raise XgbEdgeError("--rounds best: the model has no best_iteration attribute "
+                               "(it was not trained with early stopping)")
+        if not 0 <= best < total:
+            raise XgbEdgeError(f"best_iteration {best} is out of range for a model with {total} rounds")
+        if best + 1 < total:
+            notes.append(f"exporting the first {best + 1} of {total} rounds (best_iteration {best}), "
+                         "as XGBClassifier.predict() does")
+        return model.first_rounds(best + 1)
+    try:
+        n = int(rounds)
+    except (TypeError, ValueError):
+        raise XgbEdgeError(f"rounds must be auto, all, best or a number, got {rounds!r}") from None
+    if not 1 <= n <= total:
+        raise XgbEdgeError(f"--rounds {n} is out of range: the model has {total} boosting rounds")
+    if n < total:
+        notes.append(f"exporting the first {n} of {total} rounds, like predict(iteration_range=(0, {n}))")
+    return model.first_rounds(n)
+
+
 def _bit_length(n: int) -> int:
     return int(n).bit_length()
 
@@ -93,6 +137,9 @@ def export_model(model: Union[Model, str, os.PathLike], options: Optional[Export
     if not isinstance(model, Model):
         model = load(model)
 
+    notes: List[str] = []
+    model = select_rounds(model, opt.rounds, notes)
+
     tplan = plan_thresholds(model, opt.input)
     if opt.min_code_bytes not in (1, 2):
         raise XgbEdgeError("min_code_bytes must be 1 or 2")
@@ -103,7 +150,6 @@ def export_model(model: Union[Model, str, os.PathLike], options: Optional[Export
         Xv = np.asarray(validation)
         to_device_inputs(Xv, model.n_features, opt.input)  # validates range / integrality
 
-    notes: List[str] = []
     evaluation = None
     if opt.leaf_bits == "auto":
         plans = []
@@ -198,7 +244,7 @@ def build_report(exp: Export, notes: List[str]) -> Dict:
             "cuts": tp.n_cuts,
             "node_types": dict(zip(TYPE_NAMES, pk.type_counts)),
             "bytes_per_split": (len(pk.nodes) / n_split) if n_split else 0.0,
-            "bytes_per_xgboost_node": (data_bytes / (model.n_internal + model.n_leaves)),
+            "bytes_per_xgboost_node": (data_bytes / max(1, model.n_internal + model.n_leaves)),
         },
         "flash": {
             "arrays": [{"name": a.name, "type": a.ctype, "count": a.count, "bytes": a.bytes, "what": a.what}

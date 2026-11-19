@@ -205,6 +205,20 @@ class Model:
     num_parallel_tree: int
     feature_names: List[str]
     version: tuple
+    round_ptr: List[int] = None            # trees of boosting round r are [round_ptr[r], round_ptr[r + 1])
+    best_iteration: Optional[int] = None   # set by early stopping; XGBClassifier.predict stops there
+
+    @property
+    def n_rounds(self) -> int:
+        return len(self.round_ptr) - 1
+
+    def first_rounds(self, n: int) -> "Model":
+        """The model made of the first ``n`` boosting rounds only."""
+        if not 0 <= n <= self.n_rounds:
+            raise XgbEdgeError(f"cannot keep {n} rounds: the model has {self.n_rounds}")
+        import dataclasses
+        return dataclasses.replace(self, trees=self.trees[: self.round_ptr[n]],
+                                   round_ptr=self.round_ptr[: n + 1])
 
     @property
     def is_binary(self) -> bool:
@@ -433,10 +447,34 @@ def from_json(doc: dict, hook: Optional[_FloatHook] = None) -> Model:
         trees.append(_build_tree(i, jt, int(tree_info[i]), float(weights[i]), n_features,
                                  hook, feature_names))
 
+    # Boosting rounds: needed only to honour early stopping (see ExportOptions.rounds).
+    n_trees = len(trees)
+    indptr = gmodel.get("iteration_indptr")
+    if indptr is not None:
+        round_ptr = [int(v) for v in _to_int(indptr, "iteration_indptr")]
+        ok = (len(round_ptr) >= 1 and round_ptr[0] == 0 and round_ptr[-1] == n_trees
+              and all(a <= b for a, b in zip(round_ptr, round_ptr[1:])))
+        if not ok:
+            raise ModelFormatError(f"iteration_indptr {round_ptr[:6]}... is inconsistent with {n_trees} trees")
+    else:
+        per_round = n_groups * max(num_parallel_tree, 1)
+        if n_trees % per_round == 0:
+            round_ptr = list(range(0, n_trees + 1, per_round))
+        else:
+            round_ptr = [0, n_trees]
+    best_iteration = None
+    attrs = learner.get("attributes") or {}
+    if isinstance(attrs, dict) and attrs.get("best_iteration") is not None:
+        try:
+            best_iteration = int(attrs["best_iteration"])
+        except (TypeError, ValueError):
+            raise ModelFormatError(f"attribute best_iteration is not an integer: {attrs['best_iteration']!r}") from None
+
     return Model(objective=objective, n_features=n_features, n_groups=n_groups,
                  n_classes=n_classes, base_margin=base_margin, base_margin_ulps=ulps,
                  trees=trees, booster=booster, num_parallel_tree=num_parallel_tree,
-                 feature_names=feature_names, version=version)
+                 feature_names=feature_names, version=version, round_ptr=round_ptr,
+                 best_iteration=best_iteration)
 
 
 def load(path) -> Model:

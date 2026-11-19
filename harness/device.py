@@ -474,8 +474,10 @@ def main(argv=None) -> int:
     r.add_argument("--rows", type=int, default=None)
     r.add_argument("--force-upload", action="store_true")
     s = sub.add_parser("suite")
+    s.add_argument("models", nargs="*", help="zoo models (default: the on-device subset)")
     s.add_argument("--board", default="A")
     s.add_argument("--opt", default="-Os")
+    s.add_argument("--kind", default="xgbe", choices=["xgbe", "float"])
     args = ap.parse_args(argv)
     if args.cmd == "list":
         ports = list_ports()
@@ -487,10 +489,15 @@ def main(argv=None) -> int:
                         args.force_upload)
         return 0 if res["ok"] else 1
     bad = 0
-    for spec in zoo.SPECS:
-        if spec.board:
-            res = run_model(spec.name, 0, "xgbe", args.board, args.opt)
+    names = args.models or [spec.name for spec in zoo.SPECS if spec.board]
+    for name in names:
+        try:
+            res = run_model(name, 0, args.kind, args.board, args.opt)
             bad += not res["ok"]
+        except Exception as e:  # keep going: one model failing must not hide the others
+            print(f"[{name}] ERROR: {e}", flush=True)
+            bad += 1
+    print(f"suite finished: {len(names) - bad} ok, {bad} failed")
     return 1 if bad else 0
 
 
