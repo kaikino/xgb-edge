@@ -71,14 +71,25 @@ def check_version(version: str) -> List[Dict]:
         spec = zoo.Spec(f"{version}/{case}", {}, {}, 0)
         tr = zoo.Trained(spec, d, path, z["X"], z["X"].shape[0], z["cls"], z["margin"], z["leaf"], str(z["objective"]))
         # the in-place path, with the class XGBClassifier.predict reported
-        tr.xgb_class_inplace, tr.xgb_margin_inplace = z["cls_sk"], z["margin_ip"]
+        ref_cls, quirk = z["cls_sk"], None
         if not np.array_equal(z["cls_sk"], z["cls_ip"]):
-            head.append("XGBClassifier.predict differs from the class implied by inplace_predict")
+            if str(z["objective"]) == "multi:softmax" and set(np.unique(z["cls_sk"]).tolist()) <= {0, 1}:
+                # XGBoost 1.x: XGBClassifier.predict thresholds the class *indices* a natively trained
+                # multi:softmax booster returns at 0.5, so it only ever answers 0 or 1.  That is a quirk
+                # of that wrapper, not a prediction of the model; use the booster's own answer.
+                ref_cls = z["cls_ip"]
+                quirk = ("XGBClassifier.predict of this release answers only 0/1 for a natively trained "
+                         "multi:softmax model; compared with Booster.inplace_predict instead")
+            else:
+                head.append("XGBClassifier.predict differs from the class implied by inplace_predict")
+        tr.xgb_class_inplace, tr.xgb_margin_inplace = ref_cls, z["margin_ip"]
         for opts in ({}, {"leaf_bits": 16}):
             wd = os.path.join(OUT, "work", version, case, "auto" if not opts else "b16")
             r = check_variant(tr, model, opts, wd, None)
             r["failures"] = head + r["failures"]
             r.update(splits=model.n_internal, trees=len(model.trees), classes=model.n_classes)
+            if quirk:
+                r["note"] = quirk
             rows.append(r)
     return rows
 
@@ -94,6 +105,8 @@ def main(argv=None) -> int:
         print(f"\nFAIL {r['model']} [{r['variant']}]")
         for f in r["failures"]:
             print("  - " + f.replace("\n", "\n    "))
+    for note in sorted({f"{r['model']}: {r['note']}" for r in rows if r.get("note")}):
+        print("note: " + note)
     print(f"\n{len(rows)} exports from xgboost {', '.join(versions)}: {len(rows) - len(failed)} ok, {len(failed)} failed")
     # merge by version, so that checking one release does not drop the others from the summary
     path = os.path.join(OUT, "summary.json")

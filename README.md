@@ -90,8 +90,8 @@ an example program, add `--package arduino|zephyr|esp-idf`; see
 
 | option | meaning |
 |---|---|
-| `--validation FILE` | `.npy`, `.npz` or `.csv` feature matrix (NaN or empty cell = missing). Used to choose the leaf width and to report rows close to a tie. Recommended. |
-| `--leaf-bits auto\|N` | Width of the fixed-point leaf values. `auto` (default) picks the narrowest of 8, 16, 24, 32 bits that puts no validation row at risk; without validation data it uses 16. |
+| `--validation FILE` | `.npy`, `.npz` or `.csv` feature matrix (NaN or empty cell = missing; a CSV header line is skipped, any other text is an error). Used to choose the leaf width and to report rows close to a tie. Recommended. |
+| `--leaf-bits auto\|N` | Width of the fixed-point leaf values. `auto` (default) picks the narrowest of 8, 16, 24, 32 bits at which leaf rounding puts no validation row at risk (beyond rows that XGBoost's own float32 rounding already puts at risk); without validation data it uses 16. |
 | `--input f32\|i8\|u8\|i16\|u16\|i32` | Type of the feature array. With an integer type the model is evaluated on raw integer features (for example sensor counts) with integer thresholds and no float anywhere. The model must have been trained on those same integer values, and integer inputs cannot be missing. |
 | `--rounds all\|best\|N` | Required for a model trained with early stopping, where `XGBClassifier.predict` uses fewer trees than `Booster.predict`; see [Early stopping](#early-stopping). |
 | `--target cortex-m4\|esp32\|esp32c3\|avr` | Which installed cross compiler measures code size and stack for the report (default `cortex-m4`). |
@@ -186,9 +186,11 @@ per-tree class number: it walks the trees of class 0, then class 1, and so
 on, and keeps the running best. The whole run-time is one function of about
 300 bytes; prediction is the arg max of the integer margins, with no softmax.
 
-A hist-trained model costs about 4.5 bytes per split node with 16-bit leaves
-and 5.6 with 24-bit leaves (leaves included, since they live in their parent
-node), plus the cut tables.
+How many bytes a split costs depends on the field widths the model needs.
+The 5-class example below uses 4.59 bytes per split node (its leaves
+included, since they live in their parent node); with its cut tables and
+everything else that is 3.2 bytes per XGBoost node. `make parity` prints the
+figure for every test model and layout.
 
 ### The report
 
@@ -204,7 +206,7 @@ Flash
   gesture_group_end              uint8_t[5]                      5 B  trees are stored grouped by class: end index per class
   gesture_tree_size              uint8_t[250]                  250 B  byte length of each tree in the node stream
   gesture_nodes                  uint8_t[15081]             15,081 B  packed split nodes
-  model data                                                22,040 B  (exact)
+  model data                                                22,040 B  (the tables above)
   interpreter code                                             320 B  (measured for cortex-m4 with arm-none-eabi-gcc ... -Os)
   total                                                     22,360 B
 
@@ -230,12 +232,16 @@ Validation (2,350 samples)
   ...
 ```
 
-The model data size is exact by construction. The code size and the stack
-are measured by compiling the generated file with the target's compiler if
-it is installed (otherwise the report says it is an estimate). On the
-nRF52840 the reported total was equal, to the byte, to what ended up in the
-linked firmware for every model tested, and the stack figure equalled the
-stack depth measured on the board.
+The table sizes are exactly what the generated file declares. The code size
+and the stack are measured by compiling that file with the target's compiler
+if it is installed (`--target`; otherwise the report says it is an estimate),
+and the total is then the size of the compiled object. For toy models a
+compiler can fold a table of a few entries into code; the report shows that
+when it happens. On the nRF52840 the reported total was equal, to the byte,
+to the model's symbols in the linked firmware for every model tested. The
+stack figure is the frame of the predict function; the harness measures the
+stack depth on the board and fails if it exceeds the figure (with `-Os` the
+two were equal on every model).
 
 ## Results
 
@@ -255,15 +261,17 @@ thresholds and leaves, 8 bytes per node, using the board's FPU. On the board
 its margins were bit-identical to XGBoost's.
 
 <!-- table:device -->
-| model | rows sent to the board | differ from xgboost | leaf bits | flash reported by the tool (B) | flash in the linked image (B) | float baseline flash (B) | float / xgb-edge | xgb-edge time (us) | float baseline time (us) | float / xgb-edge time | worst-case comparisons | stack measured (B) | result |
+| model | rows sent to the board | differ from xgboost | leaf bits | flash reported by the tool (B) | flash in the linked image (B) | float baseline flash (B) | float / xgb-edge | xgb-edge time (us) | float baseline time (us) | float / xgb-edge time | worst-case comparisons | stack reported / measured (B) | result |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `bin_d2_r5_hist` | 1,991 | 0 | 16 | 327 | 327 | 421 | 1.3x | 8 | 8 | 0.98x | 17 | 48 | pass |
-| `bin_d6_r200_exact_missing` | 2,350 | 0 | 16 | 39,934 | 39,934 | 85,984 | 2.2x | 465 | 602 | 1.29x | 1,221 | 184 | pass |
-| `mc3_d3_r10_hist` | 1,710 | 0 | 16 | 1,924 | 1,924 | 3,801 | 2.0x | 53 | 62 | 1.17x | 128 | 56 | pass |
-| `mc5_d4_r50_hist_missing` | 2,350 | 0 | 16 | 22,360 | 22,360 | 55,007 | 2.5x | 454 | 639 | 1.41x | 1,135 | 80 | pass |
-| `mc10_digits_d6_r100_hist` | 2,955 | 0 | 24 | 56,737 | 56,737 | 157,680 | 2.8x | 1,525 | 1,867 | 1.22x | 4,146 | 112 | pass |
-| `mc10_d10_r30_exact` | 2,350 | 0 | 24 | 420,136 | 420,136 | does not fit | - | 1,140 | - | - | 3,033 | 144 | pass |
-| `mc16_d5_r397_hist` | 2,350 | 0 | 24 | 759,929 | 759,929 | does not fit | - | 13,651 | - | - | 32,027 | 80 | pass |
+| `bin_d2_r5_hist` | 1,991 | 0 | 16 | 327 | 327 | 421 | 1.3x | 8 | 8 | 0.98x | 17 | 48 / 48 | pass |
+| `bin_d6_r200_exact_missing` | 2,350 | 0 | 16 | 39,934 | 39,934 | 85,984 | 2.2x | 466 | 602 | 1.29x | 1,221 | 184 / 184 | pass |
+| `mc3_d3_r10_hist` | 1,710 | 0 | 16 | 1,924 | 1,924 | 3,801 | 2.0x | 53 | 62 | 1.17x | 128 | 56 / 56 | pass |
+| `mc5_d4_r50_hist_missing` | 2,350 | 0 | 16 | 22,360 | 22,360 | 55,007 | 2.5x | 454 | 639 | 1.41x | 1,135 | 80 / 80 | pass |
+| `mc10_digits_d6_r100_hist` | 2,955 | 0 | 24 | 56,737 | 56,737 | 157,680 | 2.8x | 1,529 | 1,867 | 1.22x | 4,146 | 112 / 112 | pass |
+| `mc10_d10_r30_exact` | 2,350 | 0 | 24 | 420,136 | 420,136 | does not fit | - | 1,140 | - | - | 3,033 | 144 / 144 | pass |
+| `mc16_d5_r397_hist` | 2,350 | 0 | 24 | 759,929 | 759,929 | does not fit | - | 13,651 | - | - | 32,027 | 80 / 80 | pass |
+| `mc3_dart` | 2,350 | 0 | 16 | 10,942 | 10,942 | 29,427 | 2.7x | 224 | 294 | 1.31x | 553 | 64 / 64 | pass |
+| `mc4_int16` | 2,145 | 0 | 16 | 41,293 | 41,293 | 130,416 | 3.2x | 578 | 866 | 1.50x | 1,539 | 64 / 64 | pass |
 <!-- /table:device -->
 
 * "rows sent to the board" are all test rows of the model: the held-out split
@@ -298,7 +306,7 @@ m2cgen 0.10.0, TL2cgen 1.0.0 with Treelite 4.8.1.
 | `mc5_d4_r50_hist_missing` | 6,816 | 22,360 | 55,007 (2.5x) | 145,366 (6.5x) | 174,602 (7.8x) | 120,186 (5.4x) | 159,154 (7.1x) | 107,382 (4.8x) |
 | `mc10_digits_d6_r100_hist` | 19,552 | 56,737 | 157,680 (2.8x) | 346,770 (6.1x) | 518,858 (9.1x) | 391,602 (6.9x) | 459,942 (8.1x) | 336,270 (5.9x) |
 | `mc10_d10_r30_exact` | 95,696 | 420,136 | 766,436 (1.8x) | does not assemble | does not assemble | does not assemble | 2,874,938 (6.8x) | 2,119,158 (5.0x) |
-| `mc16_d5_r397_hist` | 266,322 | 759,929 | 2,137,228 (2.8x) | compiler out of memory | - | - | - | - |
+| `mc16_d5_r397_hist` | 266,322 | 759,929 | 2,137,228 (2.8x) | compiler out of memory | does not assemble | does not assemble | 6,803,106 (9.0x) | 4,728,674 (6.2x) |
 
 xgb-edge needs 2.9 to 4.4 bytes per XGBoost node (splits and leaves, code included) on the models with at least 1,000 nodes.
 <!-- /table:sizes -->
@@ -313,9 +321,9 @@ xgb-edge needs 2.9 to 4.4 bytes per XGBoost node (splits and leaves, code includ
   scores; the trees are unchanged (details in `bench/altgen.py`).
 * On the host the m2cgen and TL2cgen builds were also compared with xgboost
   (`python -m bench.altgen verify`). TL2cgen's code gave xgboost's class on
-  every test row. m2cgen's differed on up to 30 rows per model, all of them
-  rows placed exactly at a split threshold: it compares in `double` against
-  decimal thresholds, which is not what XGBoost's float32 comparison does.
+  every test row. m2cgen's differed on up to 30 rows per model, none of them
+  in the held-out data: all were among the adversarial rows (values on or one
+  float32 away from a split threshold, missing values, extreme magnitudes).
 
 ### ESP32: compiled, not run
 
@@ -329,6 +337,14 @@ interpreter code differs.
 <!-- table:esp32 -->
 | model | model data (B) | code, Cortex-M4 (B) | code, ESP32 Xtensa (B) | code, ESP32-C3 RISC-V (B) | total on ESP32 (B) | total on ESP32-C3 (B) |
 |---|---:|---:|---:|---:|---:|---:|
+| `bin_d2_r5_hist` | 131 | 196 | 271 | 316 | 402 | 447 |
+| `bin_d6_r200_exact_missing` | 39,726 | 208 | 288 | 328 | 40,014 | 40,054 |
+| `mc3_d3_r10_hist` | 1,612 | 312 | 358 | 418 | 1,970 | 2,030 |
+| `mc5_d4_r50_hist_missing` | 22,040 | 320 | 374 | 434 | 22,414 | 22,474 |
+| `mc10_digits_d6_r100_hist` | 56,409 | 328 | 387 | 432 | 56,796 | 56,841 |
+| `mc10_d10_r30_exact` | 419,852 | 284 | 375 | 414 | 420,227 | 420,266 |
+| `mc16_d5_r397_hist` | 759,609 | 320 | 378 | 430 | 759,987 | 760,039 |
+| `mc3_dart` | 10,638 | 304 | 362 | 416 | 11,000 | 11,054 |
 
 | packaged example build | status | program size (B) |
 |---|---:|---:|
@@ -351,8 +367,37 @@ xgboost.
 <!-- table:parity -->
 | model | classes | trees | splits | exports | row checks | flagged in advance | differ (all flagged) | differ, not flagged | result |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `bin_d2_r5_hist` | 2 | 5 | 15 | 18 | 35,838 | 52 | 8 | 0 | pass |
+| `bin_d6_r200_exact_missing` | 2 | 200 | 5,253 | 7 | 16,450 | 28 | 0 | 0 | pass |
+| `bin_d4_r60_hinge` | 2 | 60 | 704 | 2 | 4,700 | 0 | 0 | 0 | pass |
+| `bin_d3_r40_basescore` | 2 | 40 | 251 | 2 | 4,700 | 0 | 0 | 0 | pass |
+| `bin_d10_r40_exact` | 2 | 40 | 6,681 | 3 | 7,050 | 2 | 0 | 0 | pass |
+| `mc3_d3_r10_hist` | 3 | 30 | 207 | 18 | 30,780 | 71 | 6 | 0 | pass |
+| `mc4_d2_r300_hist` | 4 | 1,200 | 3,476 | 5 | 11,750 | 296 | 2 | 0 | pass |
+| `mc5_d4_r50_hist_missing` | 5 | 250 | 3,283 | 18 | 42,300 | 665 | 14 | 0 | pass |
+| `mc5_d7_r40_exact_missing` | 5 | 200 | 9,929 | 4 | 9,400 | 0 | 0 | 0 | pass |
+| `mc7_d5_r80_softmax` | 7 | 560 | 11,599 | 2 | 4,700 | 1 | 0 | 0 | pass |
+| `mc10_digits_d6_r100_hist` | 10 | 1,000 | 9,276 | 15 | 37,569 | 593 | 25 | 0 | pass |
+| `mc10_d10_r30_exact` | 10 | 300 | 47,698 | 3 | 7,050 | 6 | 0 | 0 | pass |
+| `mc12_d8_r120_hist_missing` | 12 | 1,440 | 93,342 | 3 | 7,050 | 2 | 0 | 0 | pass |
+| `mc16_d5_r400_hist` | 16 | 6,400 | 130,925 | 3 | 7,050 | 12 | 0 | 0 | pass |
+| `mc16_d5_r397_hist` | 16 | 6,352 | 129,985 | 2 | 4,700 | 12 | 0 | 0 | pass |
 | `mc6_d6_r40_approx_missing` | 6 | 240 | 9,849 | 3 | 7,050 | 0 | 0 | 0 | pass |
-| **1 models** |  |  |  | 3 | 7,050 | 0 | 0 | 0 | pass |
+| `mc4_rf_npt3` | 4 | 300 | 7,311 | 2 | 4,700 | 1 | 1 | 0 | pass |
+| `mc3_dart` | 3 | 120 | 1,758 | 5 | 11,750 | 65 | 4 | 0 | pass |
+| `bin_dart_exact` | 2 | 30 | 208 | 2 | 4,700 | 0 | 0 | 0 | pass |
+| `mc6_lossguide_deep` | 6 | 180 | 17,100 | 4 | 9,400 | 3 | 0 | 0 | pass |
+| `mc5_maxbin1024` | 5 | 600 | 64,546 | 3 | 7,050 | 0 | 0 | 0 | pass |
+| `mc3_wide_f300` | 3 | 180 | 7,585 | 3 | 7,050 | 0 | 0 | 0 | pass |
+| `mc4_int16` | 4 | 240 | 8,002 | 7 | 15,825 | 0 | 0 | 0 | pass |
+| `mc3_int8_exact` | 3 | 90 | 2,008 | 5 | 10,750 | 0 | 0 | 0 | pass |
+| `mc5_wild_scales` | 5 | 200 | 4,634 | 3 | 7,050 | 0 | 0 | 0 | pass |
+| `mc4_degenerate_cols` | 4 | 120 | 1,592 | 3 | 7,050 | 0 | 0 | 0 | pass |
+| `mc3_single_leaf_trees` | 3 | 90 | 215 | 5 | 6,000 | 10 | 0 | 0 | pass |
+| `mc3_all_single_leaf` | 3 | 18 | 0 | 3 | 1,800 | 0 | 0 | 0 | pass |
+| `bin_few_leaf_values` | 2 | 60 | 20 | 5 | 6,182 | 0 | 0 | 0 | pass |
+| `mc26_d8_r150_hist` | 26 | 3,900 | 348,823 | 2 | 4,700 | 15 | 0 | 0 | pass |
+| **30 models** |  |  |  | 160 | 342,144 | 1834 | 60 | 0 | pass |
 <!-- /table:parity -->
 
 "Flagged in advance" counts rows the tool reported as at risk before the C
@@ -360,15 +405,20 @@ was run; most of those come from the deliberately coarse 8-bit and 12-bit
 exports. "Differ, not flagged" is the number that has to be zero.
 
 Models saved by older XGBoost releases were checked the same way, with that
-release doing both the training and the reference prediction:
+release doing both the training and the reference prediction (ordinary
+trained models plus a hand-built DART model and extreme base scores chosen to
+expose differences between releases):
 
 <!-- table:oldver -->
-| xgboost version that trained and predicted | exports | row checks | differ, not flagged | result |
-|---|---:|---:|---:|---:|
-| 2.0.3 | 14 | 16,800 | 0 | pass |
-| 2.1.4 | 14 | 16,800 | 0 | pass |
-| 3.0.5 | 14 | 16,800 | 0 | pass |
-| xgboost 1.6.2 | 1 | 0 | 0 | FAIL |
+| xgboost release that trained and predicted | models | exports | row checks | differ, not flagged | result |
+|---|---:|---:|---:|---:|---:|
+| 1.6.2 | 10 | 20 | 18,880 | 0 | pass |
+| 1.7.6 | 10 | 20 | 18,880 | 0 | pass |
+| 2.0.3 | 10 | 20 | 18,880 | 0 | pass |
+| 2.1.4 | 10 | 20 | 18,880 | 0 | pass |
+| 3.0.5 | 10 | 20 | 18,880 | 0 | pass |
+
+Each model is compared with that release's `Booster.predict` and with its `inplace_predict` / `XGBClassifier.predict`. One exception, on 1.6.2 and 1.7.6: XGBClassifier.predict of this release answers only 0/1 for a natively trained multi:softmax model; compared with Booster.inplace_predict instead.
 <!-- /table:oldver -->
 
 ## What the exporter accepts
@@ -378,10 +428,11 @@ release doing both the training and the reference prediction:
 | `multi:softprob`, `multi:softmax` (any number of classes), `binary:logistic`, `binary:hinge` | supported |
 | `tree_method` hist, exact, approx; depth-wise and loss-guide growth; any depth | supported (the interpreter is iterative, no recursion) |
 | missing values and per-split default directions | supported for float inputs (NaN = missing) |
-| `base_score` | supported, both the scalar form and the per-class vector of XGBoost 3.1+; for `binary:logistic` it is converted to a margin as XGBoost does |
+| `base_score` | supported, both the scalar form and the per-class vector of XGBoost 3.1+; for `binary:logistic` it is converted to a margin as the XGBoost release that saved the file does (releases from 3.2 on bound it to [1e-6, 1 - 1e-6] first; the report says so when that matters) |
 | `num_parallel_tree > 1` (boosted random forests) | supported |
 | DART booster | supported: each tree's weight is folded into its leaves before rounding. Both the old (`"name": "dart"`) and the 3.3+ JSON layout are read |
 | single-leaf trees | folded into the base margin |
+| a model with no trees at all (saved before any boosting round), `num_class=1` | **rejected** |
 | early stopping | you must choose with `--rounds`, see below |
 | categorical splits | **rejected** with an error naming the tree, node and feature |
 | multi-output trees (`multi_strategy="multi_output_tree"`), multi-label / multi-target | **rejected** |
@@ -392,6 +443,14 @@ release doing both the training and the reference prediction:
 
 Nothing is silently approximated: if the exporter cannot reproduce a model
 exactly up to the stated leaf rounding, it stops with an error that says why.
+
+"XGBoost's class" means what `Booster.predict` on a `DMatrix` and
+`XGBClassifier.predict` / `Booster.inplace_predict` return (argmax of the
+probabilities, or probability above 0.5 for a binary model). The test
+harness checks both paths; they can differ in the last bits of the margins,
+most visibly for DART models on XGBoost 3.0 and earlier, and the reported
+noise bound covers both. Model files written by XGBoost 1.6, 1.7, 2.0, 2.1,
+3.0 and 3.4 are tested.
 
 ### Early stopping
 
@@ -419,6 +478,11 @@ computes).
   with another `missing=` value, map it to NaN before calling. XGBoost itself
   refuses infinite inputs; the generated C treats them as larger or smaller
   than every finite value.
+* **The reference is the XGBoost release that saved the model file.** Where
+  releases differ (how a `binary:logistic` base score outside
+  [1e-6, 1 - 1e-6] becomes a margin changed in 3.2), the export follows the
+  file's release and the report notes it. If you predict with a different
+  release, re-save the model with that one first.
 * **Integer inputs** must be the exact integers the model was trained on (no
   scaling in between) and cannot be missing.
 * **Per-row `base_margin` is not supported**, nor is predicting with a subset
@@ -428,13 +492,14 @@ computes).
   accepts at most 798,720 bytes over DFU, less than the 811,008 bytes the
   Arduino core reports as the maximum (measured with
   `python -m harness.flash_limit`).
-* **Speed.** On the nRF52840, which has an FPU, inference was 1.2 to 1.4
-  times faster than the float baseline, not dramatically faster; the gain is
-  mostly flash. Small models with many features spend a visible share of the
-  time ranking features.
+* **Speed.** On the nRF52840, which has an FPU, inference was between the
+  same speed as the float baseline (a toy model) and 1.5 times faster, not
+  dramatically faster; the gain is mostly flash. Small models with many
+  features spend a visible share of the time ranking features.
 * **AVR.** The generated C compiles for 8-bit AVR, but there `const` tables
-  are copied to RAM, so only very small models are usable. AVR was not a
-  target of this work and nothing was run on one.
+  are copied to RAM (the report for `--target avr` counts them as RAM), so
+  only very small models are usable. AVR was not a target of this work and
+  nothing was run on one.
 * **Timing was measured on one MCU and one compiler.** ESP32 numbers are
   sizes of compiled code only. Zephyr, ESP-IDF and the ESP32 Arduino core were
   build-tested; only the nRF52840 Arduino builds were run on hardware.
@@ -444,12 +509,12 @@ computes).
 
 | claim | host | nRF52840 (measured) | ESP32 |
 |---|---|---|---|
-| same class as xgboost on every unflagged test row | yes: every zoo model and variant, every row | yes: 7 models, every row sent to the board | not run |
+| same class as xgboost on every unflagged test row | yes: every zoo model and variant, every row | yes: 9 models, every row sent to the board | not run |
 | integer margins equal the tool's exact simulation, bit for bit | yes | yes | not run |
 | split decisions equal xgboost's at and around thresholds | yes: property tests against xgboost itself | boundary rows are part of what is sent to the board | not run |
 | compiles without warnings under `-Wall -Wextra` | yes (clang, also `-Wpedantic -Wconversion`, and as C++) | yes (`arm-none-eabi-gcc -Werror`, and the Arduino build) | compiled only (`-Werror`, Xtensa and RISC-V) |
-| reported flash size equals the built size | model data equals `.rodata` for all three compilers | reported total equals the linked symbols, to the byte | data size checked, compiled only |
-| stack use | from `-fstack-usage` | measured on the board, equal to the report | compiled only |
+| reported flash size equals the built size | the declared tables equal `.rodata` for all three compilers (only tables of at most 8 entries, which a compiler may fold away, are exempt) | reported total equals the model's symbols in the linked image, to the byte | table sizes checked, compiled only |
+| stack use | from `-fstack-usage` | measured on the board; never above the report, equal to it at `-Os` | compiled only |
 | inference time | not measured | measured with a hardware timer | not measured |
 | float baseline, m2cgen, TL2cgen sizes | - | float baseline run on a board; m2cgen and TL2cgen objects only | not built |
 | platform packages | examples run against stub headers | Arduino example run on a board (prints `self-check OK`); Zephyr sample built, not run | Arduino and ESP-IDF examples built, not run |
@@ -492,7 +557,8 @@ python -m harness.device suite --board B --kind float bin_d2_r5_hist mc3_d3_r10_
 python -m harness.device example --board B               # the packaged Arduino example
 python -m bench.sizes --tl2cgen-parallel-comp 32         # flash sizes of the alternatives
 python -m harness.build_packages                         # Arduino, ESP-IDF and Zephyr builds
-python -m harness.results                                # the tables in this README
+python -m harness.results --update-readme                # rewrite the tables in this README
+python -m harness.results --check                        # results complete, current, and what the README shows?
 ```
 
 ## Repository layout

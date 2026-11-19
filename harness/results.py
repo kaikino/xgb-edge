@@ -127,12 +127,12 @@ def device() -> str:
             f"{f['linked_model_bytes'] / x['linked_model_bytes']:.1f}x" if f else "-",
             f"{x['timing']['us_mean']:,.0f}", f"{f['timing']['us_mean']:,.0f}" if f else "-",
             f"{f['timing']['us_mean'] / x['timing']['us_mean']:.2f}x" if f else "-",
-            _n(t["comparisons_worst_case"]), f"{x['stack_measured']}",
+            _n(t["comparisons_worst_case"]), f"{x.get('stack_reported', t.get('stack_bytes'))} / {x['stack_measured']}",
             "pass" if x["ok"] else "FAIL"])
     return _table(["model", "rows sent to the board", "differ from xgboost", "leaf bits",
                    "flash reported by the tool (B)", "flash in the linked image (B)", "float baseline flash (B)",
                    "float / xgb-edge", "xgb-edge time (us)", "float baseline time (us)", "float / xgb-edge time",
-                   "worst-case comparisons", "stack measured (B)", "result"], rows)
+                   "worst-case comparisons", "stack reported / measured (B)", "result"], rows)
 
 
 def sizes() -> str:
@@ -235,10 +235,18 @@ def oldver() -> str:
     absent = [v for v in _ov.VERSIONS if v not in by]
     if absent:
         PROBLEMS.append(f"oldver: no result for xgboost {', '.join(absent)}; run python -m harness.oldver")
-    out = [[v, len(rs), _n(sum(r.get("rows", 0) for r in rs)), sum(r.get("differ_unflagged", 0) for r in rs),
+    out = [[v, len({r["model"] for r in rs}), len(rs), _n(sum(r.get("rows", 0) for r in rs)),
+            sum(r.get("differ_unflagged", 0) for r in rs),
             "pass" if all(not r["failures"] for r in rs) else "FAIL"] for v, rs in sorted(by.items())]
-    return _table(["xgboost version that trained and predicted", "exports", "row checks", "differ, not flagged",
-                   "result"], out)
+    text = _table(["xgboost release that trained and predicted", "models", "exports", "row checks",
+                   "differ, not flagged", "result"], out)
+    notes = sorted({r["note"] for r in rows if r.get("note")})
+    if notes:
+        which = sorted({r["model"].split("/")[0] for r in rows if r.get("note")})
+        text += ("\n\nEach model is compared with that release's `Booster.predict` and with its "
+                 "`inplace_predict` / `XGBClassifier.predict`. One exception, on " + " and ".join(which)
+                 + ": " + notes[0] + ".")
+    return text
 
 
 TABLES = {"parity": parity, "device": device, "sizes": sizes, "esp32": esp32, "oldver": oldver}
