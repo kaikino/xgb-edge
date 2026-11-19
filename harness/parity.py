@@ -207,6 +207,25 @@ def check_variant(tr: zoo.Trained, model, opts: Dict, workdir: str, cross_cc: Op
     return res
 
 
+def check_synthetic(model_path: str, X: np.ndarray, opts: Dict, workdir: str, cross: bool = False) -> Dict:
+    """Run the full set of parity checks on an arbitrary model file and feature rows."""
+    from harness.synth import xgb_reference
+    X = np.ascontiguousarray(X, dtype=np.float32)
+    cls, margin, leaf = xgb_reference(model_path, X)
+    model = load(model_path)
+    head: List[str] = []
+    ref_leaf = leaf_indices(model, X)
+    if not np.array_equal(ref_leaf, leaf):
+        bad = np.argwhere(ref_leaf != leaf)
+        head.append(f"float32 reference traversal differs from xgboost pred_leaf at {bad.shape[0]} "
+                    f"(row, tree) pairs, first {tuple(bad[0])}")
+    spec = zoo.Spec(os.path.basename(model_path), {}, {}, 0)
+    tr = zoo.Trained(spec, workdir, model_path, X, X.shape[0], cls, margin, leaf.astype(np.int32), model.objective)
+    r = check_variant(tr, model, opts, workdir, find_cross_compiler() if cross else None)
+    r["failures"] = head + r["failures"]
+    return r
+
+
 def check_spec(name: str, only_variant: Optional[int] = None) -> List[Dict]:
     spec = zoo.by_name(name)
     t0 = time.time()

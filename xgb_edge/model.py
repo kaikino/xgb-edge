@@ -52,7 +52,8 @@ class _Midpoint(float):
 
 
 def _nextafter32(x: np.float32, up: bool) -> np.float32:
-    return np.nextafter(x, np.float32(np.inf if up else -np.inf), dtype=np.float32)
+    with np.errstate(over="ignore"):
+        return np.nextafter(x, np.float32(np.inf if up else -np.inf), dtype=np.float32)
 
 
 def round_decimal_to_f32(text: str) -> np.float32:
