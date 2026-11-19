@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xgb-edge"
+version = "0.1.0"
+description = "Lossless-threshold, integer-only C export of XGBoost classifiers for microcontrollers"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.22"]
+
+[project.optional-dependencies]
+test = ["xgboost>=1.7", "scikit-learn", "pytest", "hypothesis", "pyserial"]
+
+[project.scripts]
+xgb-edge = "xgb_edge.cli:main"
+
+[tool.setuptools]
+packages = ["xgb_edge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

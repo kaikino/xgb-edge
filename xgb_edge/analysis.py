@@ -1,0 +1,161 @@
+"""Evaluate a model on sample data and decide which predictions are provably safe.
+
+For every sample we compute, in exact arithmetic:
+
+* ``exact``  - the real-valued margin XGBoost approximates in float32:
+               base margin + sum of (leaf value * tree weight);
+* ``integer`` - the fixed-point margin the generated C computes.
+
+Two independent things can make the predicted class differ from XGBoost's:
+
+1. our leaf rounding (|integer / 2**shift - exact| is bounded per class by the
+   LeafPlan), and
+2. XGBoost's own float32 rounding while it sums the leaves (bounded per sample
+   below) plus the way its float32 softmax / sigmoid can turn a hair's-breadth
+   margin gap into a tie.
+
+A sample is "at risk" when the gap between the winning class and the best
+other class is not larger than those bounds.  A sample that is *not* at risk
+is guaranteed to get the same class from the generated C as from XGBoost.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import List, Sequence
+
+import numpy as np
+
+from .model import Model
+from .quantize import LeafPlan, leaf_products
+from .refsim import as_feature_matrix, tree_leaves
+
+U32 = 2.0 ** -24                 # float32 unit roundoff
+DECISION_SLACK = 2.0 ** -21      # margin gap that XGBoost's float32 softmax/sigmoid always resolves
+
+
+@dataclass
+class Shared:
+    """Quantization-independent facts about each sample."""
+
+    exact: np.ndarray        # float64 (n, groups): exact margins
+    float_noise: np.ndarray  # float64 (n, groups): bound on |XGBoost float32 margin - exact|
+    ref_class: np.ndarray    # int64 (n,): class implied by the exact margins
+    float_risk: np.ndarray   # bool (n,): XGBoost's own rounding could change its class
+    path_len: np.ndarray     # int64 (n,): split comparisons made across all stored trees
+
+
+@dataclass
+class Evaluation:
+    shared: Shared
+    integer: np.ndarray      # int64 (n, groups): margins the generated C returns
+    int_class: np.ndarray    # int64 (n,): class the generated C returns
+    quant_risk: np.ndarray   # bool (n,): leaf rounding could change the class
+
+    @property
+    def at_risk(self) -> np.ndarray:
+        return self.quant_risk | self.shared.float_risk
+
+    @property
+    def n(self) -> int:
+        return int(self.int_class.size)
+
+    @property
+    def differs_from_exact(self) -> np.ndarray:
+        return self.int_class != self.shared.ref_class
+
+
+def _classes(margins: np.ndarray, binary: bool) -> np.ndarray:
+    if binary:
+        return (margins[:, 0] > 0).astype(np.int64)
+    return np.argmax(margins, axis=1).astype(np.int64)  # first maximum, like the C code
+
+
+def evaluate(model: Model, plans: Sequence[LeafPlan], X, chunk: int = 4096) -> List[Evaluation]:
+    """Evaluate ``model`` on ``X`` for one or more leaf plans in a single pass."""
+    X = as_feature_matrix(X, model.n_features)
+    n, G = X.shape[0], model.n_groups
+    prods = leaf_products(model)
+    base = model.base_margin.astype(np.float64)
+    exact = np.zeros((n, G))
+    noise = np.zeros((n, G))
+    path_len = np.zeros(n, dtype=np.int64)
+    integer = [np.zeros((n, G), dtype=np.int64) for _ in plans]
+
+    for s in range(0, n, chunk):
+        Xc = X[s:s + chunk]
+        m = Xc.shape[0]
+        prefix = np.zeros((m, G))    # running sum of tree outputs, in model (= XGBoost) order
+        comp = np.zeros((m, G))      # Neumaier compensation for that sum
+        acc_noise = np.zeros((m, G))
+        abs_sum = np.zeros((m, G))
+        ints = [np.tile(np.asarray(p.bias, dtype=np.int64), (m, 1)) for p in plans]
+        plen = np.zeros(m, dtype=np.int64)
+        for j, tree in enumerate(model.trees):
+            g = tree.group
+            leaf = tree_leaves(tree, Xc)
+            v = prods[j][leaf]
+            # compensated running sum
+            t = prefix[:, g] + v
+            big = np.abs(prefix[:, g]) >= np.abs(v)
+            comp[:, g] += np.where(big, (prefix[:, g] - t) + v, (v - t) + prefix[:, g])
+            prefix[:, g] = t
+            cur = prefix[:, g] + comp[:, g]
+            # XGBoost adds the trees one by one in float32, starting from the base margin
+            # (CPU) or adding it last (GPU); each addition rounds by <= u * |partial sum|,
+            # and a DART weight multiplication by <= u * |v|.
+            acc_noise[:, g] += np.maximum(np.abs(cur + base[g]), np.abs(cur)) + np.abs(v)
+            abs_sum[:, g] += np.abs(v)
+            if tree.n_internal:
+                plen += tree.node_depth[leaf]
+                for k, p in enumerate(plans):
+                    ints[k][:, g] += p.q[j][leaf]
+        total = prefix + comp + base
+        ulp_base = np.array([float(np.spacing(np.float32(abs(b)))) for b in model.base_margin])
+        nz = 1.01 * U32 * (acc_noise + np.abs(total)) \
+            + model.base_margin_ulps * ulp_base \
+            + 1e-15 * (abs_sum + np.abs(base)) + len(model.trees) * 2.0 ** -149
+        exact[s:s + m] = total
+        noise[s:s + m] = nz
+        path_len[s:s + m] = plen
+        for k in range(len(plans)):
+            integer[k][s:s + m] = ints[k]
+
+    binary = model.is_binary
+    ref_class = _classes(exact, binary)
+    rows = np.arange(n)
+    if binary:
+        r, nz = exact[:, 0], noise[:, 0]
+        float_safe = np.where(r > 0, r > nz + DECISION_SLACK, r < -nz)
+    else:
+        win = exact[rows, ref_class]
+        gap = win[:, None] - exact                       # >= 0; 0 for the winner itself
+        need = noise[rows, ref_class][:, None] + noise + DECISION_SLACK
+        ok = gap > need
+        ok[rows, ref_class] = True
+        float_safe = ok.all(axis=1)
+    shared = Shared(exact=exact, float_noise=noise, ref_class=ref_class,
+                    float_risk=~float_safe, path_len=path_len)
+
+    out = []
+    for k, p in enumerate(plans):
+        if binary:
+            r = exact[:, 0]
+            quant_safe = np.where(r > 0, r + p.err_lo[0] > 0, r + p.err_hi[0] < 0)
+        else:
+            # integer_a - integer_b >= 2**shift * (gap + err_lo[a] - err_hi[b])
+            need = p.err_hi[None, :] - p.err_lo[ref_class][:, None]
+            ok = gap > need
+            ok[rows, ref_class] = True
+            quant_safe = ok.all(axis=1)
+        out.append(Evaluation(shared=shared, integer=integer[k],
+                              int_class=_classes(integer[k], binary), quant_risk=~quant_safe))
+    return out
+
+
+def margin_gap(exact: np.ndarray, binary: bool) -> np.ndarray:
+    """Distance of each sample from a tie, in margin units."""
+    if binary:
+        return np.abs(exact[:, 0])
+    part = np.partition(exact, -2, axis=1)
+    return part[:, -1] - part[:, -2]
